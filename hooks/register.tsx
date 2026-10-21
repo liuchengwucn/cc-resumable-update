@@ -329,7 +329,8 @@ async function summarize($: EngineInterface, from: string, to: string): Promise<
       return
     }
 
-    const language = await $.settings.read({ key: 'language' })
+    // The whole object, not `{ key }`: releases before 2.1.304 do not project one key.
+    const language = ((await $.settings.read()) as { language?: unknown } | undefined)?.language
     const r = await $.model.complete({
       model: 'haiku',
       maxTokens: 2000,
