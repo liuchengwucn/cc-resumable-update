@@ -1,0 +1,73 @@
+# Does `claude install <version>` reuse a binary placed in its versions folder
+# beforehand, or download it again? The resumable upgrade depends on reuse.
+name: prestage-experiment
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/prestage-experiment.yml
+
+jobs:
+  prestage:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Install Claude Code (native)
+        run: |
+          if ($IsWindows) { irm https://claude.ai/install.ps1 | iex }
+          else { bash -c 'curl -fsSL https://claude.ai/install.sh | bash' }
+
+      - name: Pre-stage another version, then claude install it
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://downloads.claude.ai/claude-code-releases'
+          $bin = Join-Path $HOME '.local' 'bin' ($IsWindows ? 'claude.exe' : 'claude')
+          $installed = ((& $bin --version) -split ' ')[0]
+          "installed: $installed"
+
+          $os = $IsWindows ? 'win32' : ($IsMacOS ? 'darwin' : 'linux')
+          $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64' ? 'arm64' : 'x64'
+          $plat = "$os-$arch"
+
+          # The newest changelog version other than the installed one that has a build.
+          $changelog = (Invoke-WebRequest 'https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md').Content
+          $target = $null
+          foreach ($m in [regex]::Matches($changelog, '(?m)^## (\d+\.\d+\.\d+)\s*$')) {
+            $v = $m.Groups[1].Value
+            if ($v -eq $installed) { continue }
+            try { $manifest = Invoke-RestMethod "$base/$v/manifest.json"; $target = $v; break } catch { }
+          }
+          $entry = $manifest.platforms.$plat
+          "target: $target ($plat, $($entry.size) bytes)"
+
+          $data = $env:XDG_DATA_HOME ? $env:XDG_DATA_HOME : (Join-Path $HOME '.local' 'share')
+          $dir = Join-Path $data 'claude' 'versions'
+          $out = Join-Path $dir $target
+          $tmp = "$out.partial"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $curl = $IsWindows ? 'curl.exe' : 'curl'
+          & $curl -fsSL -C - -o $tmp "$base/$target/$plat/$($entry.binary)"
+          $hash = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower()
+          if ($hash -ne $entry.checksum) { throw "checksum mismatch: $hash" }
+          Move-Item -Force $tmp $out
+          if (-not $IsWindows) { chmod 755 $out }
+          $before = (Get-Item $out).LastWriteTimeUtc.ToString('o')
+          "pre-staged $out at $before"
+
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & $bin install $target 2>&1 | ForEach-Object { "  | $_" }
+          $sw.Stop()
+          $after = (Get-Item $out).LastWriteTimeUtc.ToString('o')
+          $now = ((& $bin --version) -split ' ')[0]
+
+          $result = $before -eq $after ? 'REUSED' : 'DOWNLOADED AGAIN'
+          $line = "$plat | installed $installed -> $target | file $result (mtime $before -> $after) | claude install took $([int]$sw.Elapsed.TotalSeconds)s | now runs $now"
+          $line
+          "### $line" >> $env:GITHUB_STEP_SUMMARY
