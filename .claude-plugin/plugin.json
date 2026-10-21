@@ -1,6 +1,6 @@
 {
   "name": "cc-resumable-update",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Notifies you when a new Claude Code release is out on your channel, summarizes its changelog, and upgrades with a resumable download",
   "author": { "name": "Liu Chengwu", "url": "https://github.com/liuchengwucn" },
   "homepage": "https://github.com/liuchengwucn/cc-resumable-update",
