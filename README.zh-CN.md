@@ -36,9 +36,9 @@ Claude Code 自带的安装器（截至 2.1.304）下载失败后会从头重新
 ## 升级流程
 
 1. 读取 `manifest.json`（`PATH` 中有 `zstd` 时还会读取 `manifest.zst.json`），获得本平台的校验和与文件大小。
-2. 下载 zstd 压缩版（约为原大小的三分之一）；没有 `zstd` 时下载未压缩的二进制文件。文件保存在安装器的 versions 目录 `$XDG_DATA_HOME/claude/versions/` 中（默认为 `~/.local/share/claude/versions/`，Windows 上为 `%USERPROFILE%\.local\share\claude\versions\`），文件名为 `.<版本>.<平台>[.zst].partial`。目录中已有未下完的文件时，会从断点继续下载。
-3. 用发布清单校验下载文件的 SHA-256，解压后再校验一次二进制文件的 SHA-256。校验失败的文件会被删除。
-4. 将文件移动到该目录下的 `<版本>`（在 macOS 和 Linux 上加可执行权限），然后运行 `claude install <版本>`。
+2. 下载 zstd 压缩版（约为原大小的三分之一）；没有 `zstd` 时下载未压缩的二进制文件。文件保存在安装器的 versions 目录 `$XDG_DATA_HOME/claude/versions/` 中（默认为 `~/.local/share/claude/versions/`，Windows 上为 `%USERPROFILE%\.local\share\claude\versions\`），文件名为 `.<版本>.<平台>[.zst].partial`。目录中已有未下完的文件时，会从断点继续下载；同时用一个锁防止两个 Claude Code 会话同时下载同一个版本。
+3. 用发布清单校验下载文件的 SHA-256，解压后再校验一次二进制文件的 SHA-256。下载文件校验失败会被删除；已通过校验的下载文件在解压失败时会保留，重试时直接重新解压。
+4. 将文件移动到该目录下的 `<版本>`（在 macOS 和 Linux 上加可执行权限），然后运行 `claude install <版本>`。安装成功后，会删除其他版本遗留的未完成文件。
 
 通过包管理器（Homebrew、npm、WinGet）安装的用户同样会收到提醒和摘要，但不会看到 Upgrade 按钮，横幅会提示运行 `claude update`。
 

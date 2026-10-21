@@ -58,7 +58,9 @@ At the prompt of a terminal session:
    and a lock keeps two Claude Code sessions from downloading the same version
    at once.
 3. Checks the download's SHA-256 against the manifest, unpacks it, and checks
-   the unpacked binary's SHA-256 too. A file that fails a check is deleted.
+   the unpacked binary's SHA-256 too. A download that fails its check is
+   deleted; one that passed is kept when unpacking fails, so a retry only
+   unpacks it again.
 4. Moves it to `<version>` in that folder (marked executable on macOS and
    Linux) and runs `claude install <version>`. Once it succeeds, partial files
    left from other versions are removed.
