@@ -3,11 +3,13 @@ import { expect, mock, test } from 'claude-code/testing'
 const HOME = '/home/u'
 const DIR = `${HOME}/.local/share/claude/versions`
 const PLAT = 'linux-arm64'
-const RAW = { binary: 'claude', checksum: 'r'.repeat(64), size: 300 * 1024 * 1024 }
-const ZST = { binary: 'claude.zst', checksum: 'z'.repeat(64), size: 100 * 1024 * 1024 }
+const RAW = { binary: 'claude', checksum: 'a'.repeat(64), size: 300 * 1024 * 1024 }
+const ZST = { binary: 'claude.zst', checksum: 'c'.repeat(64), size: 100 * 1024 * 1024 }
 const ZTMP = `${DIR}/.2.1.310.${PLAT}.zst.partial`
 const UNPACKED = `${DIR}/.2.1.310.${PLAT}.unpacked`
 const OUT = `${DIR}/2.1.310`
+const STALE = `${DIR}/.2.1.309.${PLAT}.zst.partial`
+const STABLE = { options: { channel: 'stable' } }
 
 const CHANGELOG = [
   '# Changelog',
@@ -28,7 +30,7 @@ const BAND = {
     hasSurvey: false,
     isWorking: false,
     maxRows: 6,
-    bodyColumns: 120,
+    bodyColumns: 140,
     scroll: { offset: 0, bodyRows: 6 },
     view: {},
   },
@@ -48,29 +50,54 @@ const PANE = {
   },
 } as const
 
+type Options = {
+  // The version the stable channel points at.
+  stable: string
+  // The hash every file reports, in place of its real one.
+  badHash?: boolean
+  // claude install replaces the binary instead of reusing it.
+  redownload?: boolean
+  // zstd exits non-zero, as on a full disk.
+  unpackFails?: boolean
+  // Another session holds the download lock, its partial file fresh.
+  locked?: boolean
+  // The changelog request throws.
+  changelogThrows?: boolean
+}
+
 type World = {
   files: Map<string, number>
   hashes: Map<string, string>
+  locks: Set<string>
   toasts: string[]
   curls: number
   // Bytes each curl attempt leaves in the partial file, in order.
   curlEnds: number[]
+  fetched: string[]
   model: { system: string; prompt: string; model: string }[]
 }
 
 // Stands in for the engine and the machine: a native install of 2.1.304 on
-// linux-arm64 with zstd, the stable channel at `channel`.
-function world(on: any, channel: string, badHash = false, redownload = false): World {
+// linux-arm64 with zstd, and a partial download left from 2.1.309.
+function world(on: any, o: Options): World {
   const w: World = {
-    files: new Map([[`${DIR}/2.1.304`, RAW.size]]),
+    files: new Map([
+      [`${DIR}/2.1.304`, RAW.size],
+      [STALE, 5 * 1024 * 1024],
+    ]),
     hashes: new Map(),
+    locks: new Set(o.locked ? [`${ZTMP}.lock`] : []),
     toasts: [],
     curls: 0,
     curlEnds: [ZST.size],
+    fetched: [],
     model: [],
   }
+  if (o.locked) w.files.set(ZTMP, 10 * 1024 * 1024)
   const mtimes = new Map<string, number>()
+
   mock.store(on)
+  mock.env(on, { HOME })
   on('command.register', () => ({ value: { command: 'check-update' } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('session.version', () => ({ value: { version: '2.1.304', base: '2.1.304' } }))
@@ -79,11 +106,11 @@ function world(on: any, channel: string, badHash = false, redownload = false): W
     return { value: undefined }
   })
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('settings.read', () => ({ value: { language: 'Simplified Chinese' } }))
   on('ui.render', ($: any, e: any) => {
     const { Text } = $.ui.resolve(e)
     return <Text>engine</Text>
   })
+  on('settings.read', () => ({ value: { language: 'Simplified Chinese' } }))
   on('model.complete', (_: unknown, e: { system: string; prompt: string; model: string }) => {
     w.model.push(e)
     return {
@@ -95,11 +122,12 @@ function world(on: any, channel: string, badHash = false, redownload = false): W
     }
   })
   on('http.fetch', (_: unknown, e: { url: string }) => {
+    w.fetched.push(e.url)
     const ok = (text: string) => ({ value: { status: 200, ok: true, headers: {}, text } })
-    if (e.url.endsWith('/stable')) return ok(`${channel}\n`)
+    if (e.url.endsWith('/stable')) return ok(`${o.stable}\n`)
     if (e.url.endsWith('/2.1.310/manifest.json')) return ok(JSON.stringify({ platforms: { [PLAT]: RAW } }))
     if (e.url.endsWith('/2.1.310/manifest.zst.json')) return ok(JSON.stringify({ platforms: { [PLAT]: ZST } }))
-    if (e.url.endsWith('CHANGELOG.md')) return ok(CHANGELOG)
+    if (e.url.endsWith('CHANGELOG.md')) return o.changelogThrows ? { deny: 'ENOTFOUND' } : ok(CHANGELOG)
     return { value: { status: 404, ok: false, headers: {}, text: '' } }
   })
   on('fs.exists', (_: unknown, e: { path: string }) => ({ value: w.files.has(e.path) }))
@@ -108,13 +136,22 @@ function world(on: any, channel: string, badHash = false, redownload = false): W
       ? { value: { kind: 'file', size: w.files.get(e.path), mtimeMs: mtimes.get(e.path) ?? 0, isLink: false } }
       : { deny: 'ENOENT' },
   )
+  on('fs.list', (_: unknown, e: { path?: string }) => ({
+    value: [...w.files.keys()]
+      .filter(p => p.startsWith(`${e.path}/`))
+      .map(p => ({ name: p.slice(`${e.path}/`.length), kind: 'file', size: w.files.get(p), mtimeMs: 0, isLink: false })),
+  }))
   on('process.run', (_: unknown, e: { argv: readonly string[] }) => {
     const [cmd, ...args] = e.argv
-    const done = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
+    const done = (stdout = '', exitCode = 0) => ({ value: { exitCode, stdout, stderr: '' } })
     if (cmd === 'uname') return done('Linux aarch64\n')
-    if (cmd === 'sh' && args[1].startsWith('printf')) return done(`${HOME}\n${HOME}/.local/share\nzstd\nsha256sum\n`)
-    if (cmd === 'sha256sum') return done(`${badHash ? 'b'.repeat(64) : (w.hashes.get(args[0]) ?? '0'.repeat(64))}  ${args[0]}\n`)
+    if (args[0] === '--version') return done(`${cmd} 1.0\n`)
+    if (cmd === 'sh' && args[1].startsWith('ldd')) return done('ldd (GNU libc) 2.41\n')
+    if (cmd === 'sha256sum') {
+      return done(`${o.badHash ? 'b'.repeat(64) : (w.hashes.get(args[0]) ?? '0'.repeat(64))}  ${args[0]}\n`)
+    }
     if (cmd === 'sh' && args[1].startsWith('zstd')) {
+      if (o.unpackFails) return done('', 1)
       w.files.set(args[4], RAW.size)
       w.hashes.set(args[4], RAW.checksum)
       return done()
@@ -123,6 +160,15 @@ function world(on: any, channel: string, badHash = false, redownload = false): W
       w.files.set(args[4], w.files.get(args[3]) ?? 0)
       w.hashes.set(args[4], w.hashes.get(args[3]) ?? '')
       w.files.delete(args[3])
+      return done()
+    }
+    if (cmd === 'mkdir' && args[0] !== '-p') {
+      if (w.locks.has(args[0])) return done('', 1)
+      w.locks.add(args[0])
+      return done()
+    }
+    if (cmd === 'rmdir') {
+      w.locks.delete(args[0])
       return done()
     }
     if (cmd === 'rm') {
@@ -140,21 +186,30 @@ function world(on: any, channel: string, badHash = false, redownload = false): W
       return { value: { code: end >= ZST.size ? 0 : 18, signal: null } }
     }
     // An installer that downloads again replaces the binary, so its mtime moves.
-    if (redownload) mtimes.set(OUT, 999)
+    if (o.redownload) mtimes.set(OUT, 999)
     yield { stream: 'stdout' as const, text: 'Claude Code successfully installed!\n' }
     return { value: { code: 0, signal: null } }
   })
   return w
 }
 
-const start = async ($: any) => {
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.command.run({ command: 'check-update', args: '' })
+const start = async ($: any, isInteractive = true) => {
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive })
+  if (isInteractive) await $.command.run({ command: 'check-update', args: '' })
 }
 
-test('a newer stable release shows the band, toasts once, and can be skipped', { options: { channel: 'stable' } }, async ($, on) => {
+// Presses Upgrade then Install, and lets the upgrade run to its end.
+const upgradeAll = async (ui: any, clock: any) => {
+  await ui.press({ key: 'upgrade' })
+  await ui.press({ key: 'confirm' })
+  await clock.advance(10)
+  await clock.advance(5000)
+  await clock.settle()
+}
+
+test('a newer stable release shows the band, toasts once, and can be skipped', STABLE, async ($, on) => {
   const clock = mock.clock(on)
-  const w = world(on, '2.1.310')
+  const w = world(on, { stable: '2.1.310' })
   await start($)
   await clock.settle()
 
@@ -173,9 +228,9 @@ test('a newer stable release shows the band, toasts once, and can be skipped', {
   await ui.unmount()
 })
 
-test('upgrading downloads the zstd build with resume, verifies, unpacks and installs', { options: { channel: 'stable' } }, async ($, on) => {
+test('upgrading downloads the zstd build with resume, verifies, unpacks, installs and cleans up', STABLE, async ($, on) => {
   const clock = mock.clock(on)
-  const w = world(on, '2.1.310')
+  const w = world(on, { stable: '2.1.310' })
   // The first attempt drops after 40 MiB; the second resumes to the end.
   w.curlEnds = [40 * 1024 * 1024, ZST.size]
   await start($)
@@ -186,6 +241,9 @@ test('upgrading downloads the zstd build with resume, verifies, unpacks and inst
   expect((await ui.find({ type: 'Text', text: /Install 2\.1\.310\?/ }))?.text).toContain('Downloads 100 MiB (zstd)')
 
   await ui.press({ key: 'confirm' })
+  // The row leaves the confirm step at once, so Install cannot be pressed twice.
+  expect(await ui.find({ type: 'Button', key: 'confirm' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Preparing/ })).toBeDefined()
   await clock.advance(10)
   await clock.advance(5000)
   await clock.settle()
@@ -194,22 +252,27 @@ test('upgrading downloads the zstd build with resume, verifies, unpacks and inst
   expect(w.files.get(OUT)).toBe(RAW.size)
   expect(w.files.has(ZTMP)).toBe(false)
   expect(w.files.has(UNPACKED)).toBe(false)
+  expect(w.files.has(STALE)).toBe(false)
+  expect(w.locks.size).toBe(0)
   expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /downloaded the binary again/ })).toBeUndefined()
+
+  // Closed, the same release is not offered again before the restart.
+  await ui.press({ key: 'close' })
+  await $.command.run({ command: 'check-update', args: '' })
+  await clock.settle()
+  expect(await ui.find({ type: 'Text', text: /is available/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('a download that does not verify is removed and reported', { options: { channel: 'stable' } }, async ($, on) => {
+test('a download that does not verify is removed and reported', STABLE, async ($, on) => {
   const clock = mock.clock(on)
-  const w = world(on, '2.1.310', true)
+  const w = world(on, { stable: '2.1.310', badHash: true })
   await start($)
   await clock.settle()
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  await ui.press({ key: 'upgrade' })
-  await ui.press({ key: 'confirm' })
-  await clock.advance(10)
-  await clock.settle()
+  await upgradeAll(ui, clock)
 
   expect(w.files.has(ZTMP)).toBe(false)
   expect(w.files.has(OUT)).toBe(false)
@@ -217,9 +280,70 @@ test('a download that does not verify is removed and reported', { options: { cha
   await ui.unmount()
 })
 
-test('the changelog between the two versions is summarized in the language setting', { options: { channel: 'stable' } }, async ($, on) => {
+test('a failed unpack keeps the verified download for the retry', STABLE, async ($, on) => {
   const clock = mock.clock(on)
-  const w = world(on, '2.1.310')
+  const w = world(on, { stable: '2.1.310', unpackFails: true })
+  await start($)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await upgradeAll(ui, clock)
+
+  expect(w.files.get(ZTMP)).toBe(ZST.size)
+  expect(w.files.has(UNPACKED)).toBe(false)
+  expect((await ui.find({ type: 'Text', text: /Upgrade stopped/ }))?.text).toContain('the download is kept')
+  expect(await ui.find({ type: 'Button', key: 'retry' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a download another session holds is left alone', STABLE, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on, { stable: '2.1.310', locked: true })
+  await start($)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await upgradeAll(ui, clock)
+
+  expect(w.curls).toBe(0)
+  expect(w.files.get(ZTMP)).toBe(10 * 1024 * 1024)
+  expect((await ui.find({ type: 'Text', text: /Upgrade stopped/ }))?.text).toContain('another Claude Code session')
+  await ui.unmount()
+})
+
+test('a lock left by a session that exited is taken over', STABLE, async ($, on) => {
+  // Ten minutes on, the lock and its partial file have not moved since time 0.
+  const clock = mock.clock(on, { now: 10 * 60 * 1000 })
+  const w = world(on, { stable: '2.1.310', locked: true })
+  await start($)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await upgradeAll(ui, clock)
+
+  expect(w.curls).toBe(1)
+  expect(w.locks.size).toBe(0)
+  expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an installer that downloads the binary again is reported', STABLE, async ($, on) => {
+  const clock = mock.clock(on)
+  world(on, { stable: '2.1.310', redownload: true })
+  await start($)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await upgradeAll(ui, clock)
+
+  expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /downloaded the binary again/ }))?.text).toContain('saved nothing')
+  await ui.unmount()
+})
+
+test('the changelog between the two versions is summarized in the language setting', STABLE, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on, { stable: '2.1.310' })
   await start($)
   await clock.advance(10)
   await clock.settle()
@@ -247,9 +371,34 @@ test('the changelog between the two versions is summarized in the language setti
   expect(w.model.length).toBe(1)
 })
 
-test('the running version being the newest shows nothing', { options: { channel: 'stable' } }, async ($, on) => {
+test('a changelog that cannot be fetched ends the summary as failed, not pending', STABLE, async ($, on) => {
   const clock = mock.clock(on)
-  world(on, '2.1.304')
+  world(on, { stable: '2.1.310', changelogThrows: true })
+  await start($)
+  await clock.advance(10)
+  await clock.settle()
+
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await band.find({ type: 'Button', key: 'news' })).toBeDefined()
+  await band.unmount()
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await pane.find({ type: 'Text', text: /could not be written/ }))?.text).toContain('ENOTFOUND')
+  await pane.unmount()
+})
+
+test('a non-interactive session does not check', STABLE, async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on, { stable: '2.1.310' })
+  await start($, false)
+  await clock.settle()
+
+  expect(w.fetched).toEqual([])
+  expect(w.toasts).toEqual([])
+})
+
+test('the running version being the newest shows nothing', STABLE, async ($, on) => {
+  const clock = mock.clock(on)
+  world(on, { stable: '2.1.304' })
   await start($)
   await clock.settle()
 
@@ -258,24 +407,33 @@ test('the running version being the newest shows nothing', { options: { channel:
   await ui.unmount()
 })
 
-test('on Windows the plain build downloads with curl.exe and moves into place through PowerShell', { options: { channel: 'stable' } }, async ($, on) => {
+test('on Windows the plain build downloads with curl.exe and moves into place through PowerShell', STABLE, async ($, on) => {
   const clock = mock.clock(on)
-  const WHOME = 'C:\\Users\\u'
+  const WHOME = 'C:\\Users\\张三'
   const WDIR = `${WHOME}\\.local\\share\\claude\\versions`
-  const WRAW = { binary: 'claude.exe', checksum: 'w'.repeat(64), size: 290 * 1024 * 1024 }
+  const WRAW = { binary: 'claude.exe', checksum: 'e'.repeat(64), size: 290 * 1024 * 1024 }
   const WTMP = `${WDIR}\\.2.1.310.win32-x64.partial`
   const files = new Map<string, number>([[`${WDIR}\\2.1.304`, WRAW.size], [`${WHOME}\\.local\\bin\\claude.exe`, 1]])
   const hashes = new Map<string, string>()
   const spawned: string[][] = []
   const ps: { script: string; env?: Record<string, string> }[] = []
+  // The kit runs on Unix and reads C:\ paths as relative to the working directory.
+  const win = (p: string) => p.slice(Math.max(0, p.indexOf('C:\\')))
 
   mock.store(on)
+  mock.env(on, { USERPROFILE: WHOME, OS: 'Windows_NT', PROCESSOR_ARCHITECTURE: 'AMD64' })
   on('command.register', () => ({ value: { command: 'check-update' } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('session.version', () => ({ value: { version: '2.1.304', base: '2.1.304' } }))
   on('ui.toast', () => ({ value: undefined }))
   on('settings.read', () => ({ value: {} }))
-  on('model.complete', () => ({ value: { isAnswered: false, reason: 'empty-reply', usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }))
+  on('model.complete', () => ({
+    value: {
+      isAnswered: false,
+      reason: 'empty-reply',
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  }))
   on('ui.render', ($: any, e: any) => {
     const { Text } = $.ui.resolve(e)
     return <Text>engine</Text>
@@ -286,20 +444,21 @@ test('on Windows the plain build downloads with curl.exe and moves into place th
     if (e.url.endsWith('/2.1.310/manifest.json')) return ok(JSON.stringify({ platforms: { 'win32-x64': WRAW } }))
     return { value: { status: 404, ok: false, headers: {}, text: '' } }
   })
-  // The kit runs on Unix and reads C:\ paths as relative to the working directory.
-  const win = (p: string) => p.slice(Math.max(0, p.indexOf('C:\\')))
   on('fs.exists', (_: unknown, e: { path: string }) => ({ value: files.has(win(e.path)) }))
   on('fs.stat', (_: unknown, e: { path: string }) =>
-    files.has(win(e.path)) ? { value: { kind: 'file', size: files.get(win(e.path)), mtimeMs: 0, isLink: false } } : { deny: 'ENOENT' },
+    files.has(win(e.path))
+      ? { value: { kind: 'file', size: files.get(win(e.path)), mtimeMs: 0, isLink: false } }
+      : { deny: 'ENOENT' },
   )
+  on('fs.list', () => ({ value: [] }))
   on('process.run', (_: unknown, e: { argv: readonly string[]; init?: { env?: Record<string, string> } }) => {
     const done = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '' } })
-    if (e.argv[0] === 'uname') return { deny: 'ENOENT' }
+    // No uname and no zstd on this machine.
+    if (e.argv[0] === 'uname' || e.argv[0] === 'zstd') return { deny: 'ENOENT' }
     if (e.argv[0] !== 'powershell') return done()
     const script = e.argv[e.argv.length - 1]
     const env = e.init?.env
     ps.push({ script, env })
-    if (script.startsWith('$env:USERPROFILE')) return done(`${WHOME}\r\n${WHOME}\\.local\\share\r\nAMD64 \r\n`)
     if (script.includes('Get-FileHash')) return done(`${(hashes.get(env!.CRU_A) ?? '0'.repeat(64)).toUpperCase()}\r\n`)
     if (script.startsWith('Move-Item')) {
       files.set(env!.CRU_B, files.get(env!.CRU_A) ?? 0)
@@ -328,28 +487,15 @@ test('on Windows the plain build downloads with curl.exe and moves into place th
   await clock.advance(10)
   await clock.settle()
 
+  // A non-ASCII profile folder reaches every path intact.
   expect(spawned[0].slice(0, 4)).toEqual(['curl.exe', '-fL', '-C', '-'])
+  expect(spawned[0]).toContain(WTMP)
   expect(spawned[0][spawned[0].length - 1]).toBe('https://downloads.claude.ai/claude-code-releases/2.1.310/win32-x64/claude.exe')
   expect(spawned[1]).toEqual([`${WHOME}\\.local\\bin\\claude.exe`, 'install', '2.1.310'])
   expect(files.get(`${WDIR}\\2.1.310`)).toBe(WRAW.size)
   expect(ps.some(c => c.script.startsWith('Move-Item') && c.env?.CRU_A === WTMP)).toBe(true)
+  expect(ps.some(c => c.script.includes('-ErrorAction Stop') && c.env?.CRU_A === `${WTMP}.lock`)).toBe(true)
+  expect(ps.every(c => !c.script.includes('"'))).toBe(true)
   expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
-  await ui.unmount()
-})
-
-test('an installer that downloads the binary again is reported', { options: { channel: 'stable' } }, async ($, on) => {
-  const clock = mock.clock(on)
-  world(on, '2.1.310', false, true)
-  await start($)
-  await clock.settle()
-
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  await ui.press({ key: 'upgrade' })
-  await ui.press({ key: 'confirm' })
-  await clock.advance(10)
-  await clock.settle()
-
-  expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
-  expect((await ui.find({ type: 'Text', text: /downloaded the binary again/ }))?.text).toContain('saved nothing')
   await ui.unmount()
 })

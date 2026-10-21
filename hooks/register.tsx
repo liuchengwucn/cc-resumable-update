@@ -13,6 +13,11 @@ const PANE = 'cc-resumable-update'
 const MAX_IDLE_ATTEMPTS = 5
 // Changelog text handed to the model, at most.
 const MAX_NOTES_CHARS = 150_000
+// A download lock whose partial file has not grown for this long is taken to be
+// left by a session that exited, and is taken over.
+const STALE_LOCK_MS = 2 * 60 * 1000
+// What this mod leaves in the versions folder while it works.
+const LEFTOVER = /^\.\d+\.\d+\.\d+\..+\.(partial|unpacked)$/
 
 const notice = atom({ plugin: 'cc-resumable-update', key: 'notice' } as const, null)
 const upgrade = atom({ plugin: 'cc-resumable-update', key: 'upgrade' } as const, null)
@@ -20,33 +25,93 @@ const summary = atom({ plugin: 'cc-resumable-update', key: 'summary' } as const,
 
 type Channel = 'stable' | 'latest'
 
-// Where the native installer keeps versions, and the tools found on this machine.
-type Machine = {
-  os: 'unix' | 'windows'
-  plat: string
-  home: string
-  // $XDG_DATA_HOME, or ~/.local/share: where the installer keeps claude/versions.
-  data: string
-  hasZstd: boolean
-  sha: readonly string[]
+// A command to run without a shell, and the environment it needs.
+type Cmd = { argv: readonly string[]; env?: Record<string, string> }
+
+// The commands for each file operation on one operating system.
+type Commands = {
+  curl: string
+  sha256: (path: string) => Cmd
+  makeDir: (dir: string) => Cmd
+  // Creates `dir`, failing when it exists: an atomic lock.
+  lock: (dir: string) => Cmd
+  unlock: (dir: string) => Cmd
+  remove: (path: string) => Cmd
+  unpack: (src: string, dst: string) => Cmd
+  // Moves the verified binary into place. The installer takes a retained
+  // version only when it is executable, hence the chmod on Unix.
+  move: (src: string, dst: string) => Cmd
 }
 
-// `other` is a system neither probe recognized: it upgrades through
-// `claude install` alone, without a resumable download.
-type Host = Machine | { os: 'other' }
+function unixCommands(sha: readonly string[]): Commands {
+  return {
+    curl: 'curl',
+    sha256: path => ({ argv: [...sha, path] }),
+    makeDir: dir => ({ argv: ['mkdir', '-p', dir] }),
+    lock: dir => ({ argv: ['mkdir', dir] }),
+    unlock: dir => ({ argv: ['rmdir', dir] }),
+    remove: path => ({ argv: ['rm', '-f', path] }),
+    // Through redirection, not path arguments: some zstd wrappers do not map paths.
+    unpack: (src, dst) => ({ argv: ['sh', '-c', 'zstd -q -d <"$1" >"$2"', '_', src, dst] }),
+    move: (src, dst) => ({ argv: ['sh', '-c', 'mv -f "$1" "$2" && chmod 755 "$2"', '_', src, dst] }),
+  }
+}
 
-// Windows file operations go through PowerShell, their paths through the
+// Windows file operations go through PowerShell with their paths in the
 // environment (CRU_A, CRU_B), so no path needs quoting. The scripts hold no
 // double quotes: Windows argument quoting does not carry them reliably.
-const PS = ['powershell', '-NoProfile', '-NonInteractive', '-Command'] as const
+function powershell(script: string, a: string, b = ''): Cmd {
+  return { argv: ['powershell', '-NoProfile', '-NonInteractive', '-Command', script], env: { CRU_A: a, CRU_B: b } }
+}
+
+const WINDOWS: Commands = {
+  curl: 'curl.exe',
+  sha256: path => powershell('(Get-FileHash -Algorithm SHA256 -LiteralPath $env:CRU_A).Hash', path),
+  makeDir: dir => powershell('New-Item -ItemType Directory -Force -Path $env:CRU_A | Out-Null', dir),
+  lock: dir => powershell('New-Item -ItemType Directory -Path $env:CRU_A -ErrorAction Stop | Out-Null', dir),
+  unlock: dir => powershell('Remove-Item -Force -LiteralPath $env:CRU_A', dir),
+  remove: path => powershell('Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $env:CRU_A', path),
+  unpack: (src, dst) => ({ argv: ['zstd', '-q', '-d', '-f', src, '-o', dst] }),
+  move: (src, dst) => powershell('Move-Item -Force -LiteralPath $env:CRU_A -Destination $env:CRU_B', src, dst),
+}
+
+// Where the native installer keeps versions, and how to work on files here.
+type Machine = {
+  plat: string
+  sep: '/' | '\\'
+  // $XDG_DATA_HOME, or ~/.local/share: where the installer keeps claude/versions.
+  data: string
+  // The native launcher, `claude install` runs through it.
+  launcher: string
+  hasZstd: boolean
+  cmd: Commands
+}
+
+// `null`: a system this mod does not recognize, which upgrades through
+// `claude install` alone, without a resumable download.
+type Host = Machine | null
 
 type Entry = { binary: string; checksum: string; size: number }
 
+type Plan = {
+  version: string
+  raw: Entry
+  file: Entry
+  out: string
+  url: string
+  tmp: string
+  isReady: boolean
+}
+
 let channel: Channel = 'stable'
-let host: Host | null = null
+let host: Host | undefined
 let checkInFlight: Promise<string> | null = null
 let summaryInFlight = ''
+// One upgrade at a time in this session; isCancelled is its Cancel.
+let isUpgrading = false
 let isCancelled = false
+// The plan Upgrade worked out, reused by Install.
+let planned: Plan | null = null
 
 function isNewer(a: string, b: string): boolean {
   const x = a.split('.').map(Number)
@@ -63,81 +128,68 @@ function after($: EngineInterface, ms: number): Promise<void> {
   })
 }
 
-async function getHost($: EngineInterface): Promise<Host> {
-  if (host) return host
-
-  let uname = ''
+async function run($: EngineInterface, c: Cmd, timeoutMs = 30_000) {
   try {
-    const r = await $.process.run(['uname', '-sm'])
-    if (r.exitCode === 0) uname = r.stdout.trim()
-  } catch {
-    uname = ''
+    return await $.process.run(c.argv, { env: c.env, timeoutMs })
+  } catch (err) {
+    return { exitCode: -1, stdout: '', stderr: String(err) }
   }
-  const [sys, mach] = uname.split(/\s+/)
-  if (sys !== 'Linux' && sys !== 'Darwin') {
-    host = await getWindows($)
+}
+
+// Whether `argv` starts and exits 0: how a tool is found, as the mod runs it.
+async function runs($: EngineInterface, argv: readonly string[]): Promise<boolean> {
+  return (await run($, { argv })).exitCode === 0
+}
+
+async function getHost($: EngineInterface): Promise<Host> {
+  if (host !== undefined) return host
+
+  const uname = await run($, { argv: ['uname', '-sm'] })
+  const [sys, mach] = uname.exitCode === 0 ? uname.stdout.trim().split(/\s+/) : []
+  const hasZstd = await runs($, ['zstd', '--version'])
+
+  if (sys === 'Linux' || sys === 'Darwin') {
+    const home = (await $.env.get('HOME')) ?? ''
+    const data = (await $.env.get('XDG_DATA_HOME')) || `${home}/.local/share`
+    const ldd = sys === 'Linux' ? await run($, { argv: ['sh', '-c', 'ldd --version 2>&1'] }) : null
+    const musl = /musl/i.test(ldd?.stdout ?? '') ? '-musl' : ''
+    const sha = (await runs($, ['sha256sum', '--version'])) ? ['sha256sum'] : ['shasum', '-a', '256']
+    host = {
+      plat: `${sys === 'Darwin' ? 'darwin' : 'linux'}-${/^(aarch64|arm64)$/.test(mach ?? '') ? 'arm64' : 'x64'}${musl}`,
+      sep: '/',
+      data,
+      launcher: `${home}/.local/bin/claude`,
+      hasZstd,
+      cmd: unixCommands(sha),
+    }
     return host
   }
 
-  const probe = await $.process.run([
-    'sh',
-    '-c',
-    'printf "%s\\n%s\\n" "$HOME" "${XDG_DATA_HOME:-$HOME/.local/share}"; command -v zstd >/dev/null && echo zstd; ' +
-      'command -v sha256sum >/dev/null && echo sha256sum; ' +
-      '{ ldd --version 2>&1 | grep -qi musl; } && echo musl; true',
-  ])
-  const [home, data, ...flags] = probe.stdout.split('\n').map(s => s.trim())
-  const arch = /^(aarch64|arm64)$/.test(mach ?? '') ? 'arm64' : 'x64'
-  const musl = flags.includes('musl') ? '-musl' : ''
-
+  // Windows has no `uname`. Paths come from the environment, never from a
+  // child's output, which Windows PowerShell writes in the console code page.
+  const profile = await $.env.get('USERPROFILE')
+  if (!profile || (await $.env.get('OS')) !== 'Windows_NT') {
+    host = null
+    return host
+  }
+  const arch = `${(await $.env.get('PROCESSOR_ARCHITEW6432')) ?? ''} ${(await $.env.get('PROCESSOR_ARCHITECTURE')) ?? ''}`
   host = {
-    os: 'unix',
-    plat: `${sys === 'Darwin' ? 'darwin' : 'linux'}-${arch}${musl}`,
-    home,
-    data,
-    hasZstd: flags.includes('zstd'),
-    sha: flags.includes('sha256sum') ? ['sha256sum'] : ['shasum', '-a', '256'],
+    plat: `win32-${/ARM64/i.test(arch) ? 'arm64' : 'x64'}`,
+    sep: '\\',
+    data: (await $.env.get('XDG_DATA_HOME')) || `${profile}\\.local\\share`,
+    launcher: `${profile}\\.local\\bin\\claude.exe`,
+    hasZstd,
+    cmd: WINDOWS,
   }
   return host
 }
 
-// Windows has no `uname`; PowerShell answers the same questions there.
-async function getWindows($: EngineInterface): Promise<Host> {
-  let lines: string[] = []
-  try {
-    const r = await $.process.run([
-      ...PS,
-      "$env:USERPROFILE; if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $env:USERPROFILE '.local\\share' }; " +
-        "$env:PROCESSOR_ARCHITECTURE + ' ' + $env:PROCESSOR_ARCHITEW6432; " +
-        "if (Get-Command zstd -ErrorAction SilentlyContinue) { 'zstd' }",
-    ])
-    if (r.exitCode === 0) lines = r.stdout.split(/\r?\n/).map(s => s.trim())
-  } catch {
-    lines = []
-  }
-  const [home, data, arch, ...flags] = lines
-  if (!home || !data) return { os: 'other' }
-
-  return {
-    os: 'windows',
-    plat: `win32-${/ARM64/i.test(arch ?? '') ? 'arm64' : 'x64'}`,
-    home,
-    data,
-    hasZstd: flags.includes('zstd'),
-    sha: [],
-  }
-}
-
 function join(m: Machine, ...parts: string[]): string {
-  return parts.join(m.os === 'windows' ? '\\' : '/')
+  return parts.join(m.sep)
 }
 
 function versionsDir(m: Machine): string {
   return join(m, m.data, 'claude', 'versions')
-}
-
-function claudeBin(m: Machine): string {
-  return m.os === 'windows' ? join(m, m.home, '.local', 'bin', 'claude.exe') : join(m, m.home, '.local', 'bin', 'claude')
 }
 
 async function entryOf($: EngineInterface, url: string, plat: string): Promise<Entry | null> {
@@ -153,58 +205,19 @@ async function sizeOf($: EngineInterface, path: string): Promise<number> {
   return $.fs.stat(path).then(s => s.size, () => 0)
 }
 
-async function sha256($: EngineInterface, m: Machine, path: string): Promise<string> {
-  const r =
-    m.os === 'windows'
-      ? await $.process.run([...PS, '(Get-FileHash -Algorithm SHA256 -LiteralPath $env:CRU_A).Hash'], {
-          env: { CRU_A: path },
-          timeoutMs: 300_000,
-        })
-      : await $.process.run([...m.sha, path], { timeoutMs: 300_000 })
-  return r.exitCode === 0 ? r.stdout.trim().split(/\s+/)[0].toLowerCase() : ''
+async function mtimeOf($: EngineInterface, path: string): Promise<number | null> {
+  return $.fs.stat(path).then(s => s.mtimeMs, () => null)
 }
 
-async function makeDir($: EngineInterface, m: Machine, dir: string): Promise<void> {
-  await (m.os === 'windows'
-    ? $.process.run([...PS, 'New-Item -ItemType Directory -Force -Path $env:CRU_A | Out-Null'], { env: { CRU_A: dir } })
-    : $.process.run(['mkdir', '-p', dir]))
+// The file's SHA-256 in lower case, or null when the hashing tool failed.
+async function sha256($: EngineInterface, m: Machine, path: string): Promise<string | null> {
+  const r = await run($, m.cmd.sha256(path), 300_000)
+  const hash = r.stdout.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
+  return r.exitCode === 0 && /^[0-9a-f]{64}$/.test(hash) ? hash : null
 }
 
-async function removeFiles($: EngineInterface, m: Machine, ...paths: string[]): Promise<void> {
-  if (m.os !== 'windows') {
-    await $.process.run(['rm', '-f', ...paths])
-    return
-  }
-  for (const path of paths) {
-    await $.process.run([...PS, 'Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $env:CRU_A'], {
-      env: { CRU_A: path },
-    })
-  }
-}
-
-async function unpack($: EngineInterface, m: Machine, src: string, dst: string): Promise<boolean> {
-  // On Unix through redirection, not path arguments: some zstd wrappers do not map paths.
-  const r =
-    m.os === 'windows'
-      ? await $.process.run(['zstd', '-q', '-d', '-f', src, '-o', dst], { timeoutMs: 300_000 })
-      : await $.process.run(['sh', '-c', 'zstd -q -d <"$1" >"$2"', '_', src, dst], { timeoutMs: 300_000 })
-  return r.exitCode === 0
-}
-
-// Moves the verified binary into place. The installer takes a retained version
-// only when it is executable, hence the chmod on Unix.
-async function moveInto($: EngineInterface, m: Machine, src: string, dst: string): Promise<string> {
-  const r =
-    m.os === 'windows'
-      ? await $.process.run([...PS, 'Move-Item -Force -LiteralPath $env:CRU_A -Destination $env:CRU_B'], {
-          env: { CRU_A: src, CRU_B: dst },
-        })
-      : await $.process.run(['sh', '-c', 'mv -f "$1" "$2" && chmod 755 "$2"', '_', src, dst])
-  return r.exitCode === 0 ? '' : r.stderr.trim() || 'could not move the binary into place'
-}
-
-// The download a confirm names: the compressed build when zstd is here.
-async function plan($: EngineInterface, m: Machine, v: string) {
+// The download for version `v`: the compressed build when zstd runs here.
+async function plan($: EngineInterface, m: Machine, v: string): Promise<Plan> {
   const raw = await entryOf($, `${RELEASES}/${v}/manifest.json`, m.plat)
   if (raw === null) throw new Error(`no ${m.plat} build listed for ${v}`)
   const zst = m.hasZstd ? await entryOf($, `${RELEASES}/${v}/manifest.zst.json`, m.plat) : null
@@ -214,10 +227,11 @@ async function plan($: EngineInterface, m: Machine, v: string) {
   const file = zst ?? raw
 
   return {
+    version: v,
     raw,
+    file,
     out,
     isReady,
-    file,
     url: `${RELEASES}/${v}/${m.plat}/${file.binary}`,
     tmp: join(m, dir, `.${v}.${m.plat}${zst ? '.zst' : ''}.partial`),
   }
@@ -232,7 +246,7 @@ function check($: EngineInterface): Promise<string> {
   return checkInFlight
 }
 
-// Sets the notice; the upgrade row stays while it is for the same version, or running.
+// Sets the notice. An upgrade row stays while it runs or is for the new target.
 async function setNotice($: EngineInterface, next: Notice | null): Promise<void> {
   await update($, notice, () => next)
   await update($, upgrade, u => (u?.phase === 'running' || u?.version === next?.target ? u : null))
@@ -248,17 +262,26 @@ async function runCheck($: EngineInterface): Promise<string> {
     return `Could not read the ${channel} channel (HTTP ${res.status})`
   }
 
+  const m = await getHost($)
+  // Installed by this mod and waiting for a restart: nothing more to offer.
+  const isInstalled =
+    m !== null &&
+    (await $.store.get('installed')) === target &&
+    (await $.fs.exists(join(m, versionsDir(m), target)).catch(() => false))
+  if (isInstalled && (await read($, upgrade))?.phase !== 'done') {
+    await setNotice($, null)
+    return `Claude Code ${target} is installed; restart claude to use it`
+  }
+
   if (!isNewer(target, current) || (await $.store.get('skipped')) === target) {
     await setNotice($, null)
     return `Claude Code ${current} is up to date (${channel}: ${target})`
   }
 
-  const h = await getHost($)
-  const isNative =
-    h.os === 'other' || (await $.fs.exists(join(h, versionsDir(h), current)).catch(() => false))
+  const isNative = m === null || (await $.fs.exists(join(m, versionsDir(m), current)).catch(() => false))
   await setNotice($, { target, current, isNative })
   $.clock.after(1, () => {
-    void summarize($, current, target).catch(() => undefined)
+    void summarize($, current, target)
   })
 
   if ((await $.store.get('toasted')) !== target) {
@@ -301,7 +324,8 @@ async function summarize($: EngineInterface, from: string, to: string): Promise<
     const res = await $.http.fetch(CHANGELOG_URL)
     const notes = res.ok ? notesBetween(res.text, from, to) : ''
     if (notes === '') {
-      await set({ from, to, status: 'failed', text: `No changelog entries found for ${from} → ${to} yet.` })
+      const why = res.ok ? `No changelog entries found for ${from} → ${to} yet.` : `Could not fetch the changelog (HTTP ${res.status}).`
+      await set({ from, to, status: 'failed', text: why })
       return
     }
 
@@ -324,29 +348,61 @@ async function summarize($: EngineInterface, from: string, to: string): Promise<
     } else {
       await set({ from, to, status: 'failed', text: `The summary could not be written (${r.reason}).` })
     }
+  } catch (err) {
+    await set({ from, to, status: 'failed', text: `The summary could not be written (${String(err)}).` })
   } finally {
     summaryInFlight = ''
   }
 }
 
-// Shows the size of the download, so the person confirms knowing what it costs.
-async function askConfirm($: EngineInterface, n: Notice): Promise<void> {
-  const v = n.target
-  const h = await getHost($)
+// Works out the size of the download, so the person confirms knowing what it costs.
+async function askConfirm($: EngineInterface, v: string): Promise<void> {
+  await update($, upgrade, () => ({ phase: 'preparing', version: v }))
+  const m = await getHost($)
   let downloadMiB: number | null = null
   let isCompressed = false
+  planned = null
 
-  if (h.os !== 'other') {
+  if (m !== null) {
     try {
-      const p = await plan($, h, v)
-      isCompressed = p.file !== p.raw
-      downloadMiB = p.isReady ? 0 : Math.max(0, p.file.size - (await sizeOf($, p.tmp))) / MiB
+      planned = await plan($, m, v)
+      isCompressed = planned.file !== planned.raw
+      downloadMiB = planned.isReady ? 0 : Math.max(0, planned.file.size - (await sizeOf($, planned.tmp))) / MiB
     } catch {
       downloadMiB = null
     }
   }
 
-  await update($, upgrade, () => ({ phase: 'confirm', version: v, downloadMiB, isCompressed }))
+  await update($, upgrade, u =>
+    u?.phase === 'preparing' && u.version === v ? { phase: 'confirm', version: v, downloadMiB, isCompressed } : u,
+  )
+}
+
+// Starts the upgrade on a timer of its own, outside the press's dispatch. The
+// row shows it at once, so a second press finds no Install or Cancel to press.
+async function startUpgrade($: EngineInterface, v: string): Promise<void> {
+  if (isUpgrading) return
+  isUpgrading = true
+  isCancelled = false
+  await update($, upgrade, () => ({
+    phase: 'running',
+    version: v,
+    stage: 'prepare',
+    doneMiB: 0,
+    totalMiB: 0,
+    line: '',
+    isCancelling: false,
+  }))
+  $.clock.after(1, () => {
+    void runUpgrade($, v).finally(() => {
+      isUpgrading = false
+    })
+  })
+}
+
+async function cancelUpgrade($: EngineInterface): Promise<void> {
+  isCancelled = true
+  await update($, upgrade, u => (u?.phase === 'running' ? { ...u, isCancelling: true } : u))
 }
 
 // Downloads `url` into `tmp` with resume until it holds `size` bytes.
@@ -366,11 +422,12 @@ async function download(
     if (have >= size) return 'ok'
     if (isCancelled) return 'cancelled'
 
-    // --speed-limit/--speed-time: under 1 KB/s for 30 s counts as stalled, so curl
-    // exits and the next attempt resumes. --progress-bar keeps chunks coming,
-    // which is when the loop redraws and sees a cancel.
+    // --speed-limit/--speed-time: under 1 KB/s for 30 s counts as stalled, so
+    // curl exits and the next attempt resumes. Each progress chunk is when the
+    // loop redraws and sees a cancel; a stalled transfer writes none, so a
+    // cancel then waits for curl to give up, 30 s at most.
     const child = $.process.spawn({
-      argv: [m.os === 'windows' ? 'curl.exe' : 'curl', '-fL', '-C', '-', '--speed-limit', '1024', '--speed-time', '30', '--progress-bar', '-o', tmp, url],
+      argv: [m.cmd.curl, '-fL', '-C', '-', '--speed-limit', '1024', '--speed-time', '30', '--progress-bar', '-o', tmp, url],
     })
     let lastDrawn = 0
     let error = ''
@@ -401,49 +458,82 @@ async function download(
   }
 }
 
+// Takes the download lock of `tmp`, taking over one whose partial file has not
+// grown for STALE_LOCK_MS. False when another session is downloading.
+async function lock($: EngineInterface, m: Machine, tmp: string): Promise<boolean> {
+  const dir = `${tmp}.lock`
+  if ((await run($, m.cmd.lock(dir))).exitCode === 0) return true
+
+  const now = await $.clock.now()
+  const touched = Math.max((await mtimeOf($, dir)) ?? 0, (await mtimeOf($, tmp)) ?? 0)
+  if (now - touched < STALE_LOCK_MS) return false
+
+  await run($, m.cmd.unlock(dir))
+  return (await run($, m.cmd.lock(dir))).exitCode === 0
+}
+
 // Leaves a verified binary at `versions/<v>`, where `claude install <v>` takes it
 // as already downloaded. Resolves `ok`, `cancelled`, or why it stopped.
 async function fetchBinary($: EngineInterface, m: Machine, v: string): Promise<string> {
-  const p = await plan($, m, v)
+  const p = planned?.version === v ? planned : await plan($, m, v)
+  planned = null
   if (p.isReady) return 'ok'
 
   const running = (stage: 'download' | 'verify' | 'unpack', done: number) =>
-    update($, upgrade, () => ({
-      phase: 'running',
-      version: v,
-      stage,
-      doneMiB: done / MiB,
-      totalMiB: p.file.size / MiB,
-      line: '',
-    }))
+    update($, upgrade, u =>
+      u?.phase === 'running'
+        ? { ...u, stage, doneMiB: done / MiB, totalMiB: p.file.size / MiB, line: '' }
+        : u,
+    )
 
-  await makeDir($, m, versionsDir(m))
-  const got = await download($, m, p.url, p.tmp, p.file.size, bytes => running('download', bytes))
-  if (got !== 'ok') return got
-
-  await running('verify', p.file.size)
-  if ((await sha256($, m, p.tmp)) !== p.file.checksum) {
-    await removeFiles($, m, p.tmp)
-    return 'checksum mismatch on the download; it was removed, retry to download again'
+  await run($, m.cmd.makeDir(versionsDir(m)))
+  if (!(await lock($, m, p.tmp))) {
+    return 'another Claude Code session is downloading this version; retry once it is done'
   }
 
-  let unpacked = p.tmp
-  if (p.file !== p.raw) {
-    await running('unpack', p.file.size)
-    unpacked = join(m, versionsDir(m), `.${v}.${m.plat}.unpacked`)
-    if (!(await unpack($, m, p.tmp, unpacked)) || (await sha256($, m, unpacked)) !== p.raw.checksum) {
-      await removeFiles($, m, p.tmp, unpacked)
-      return 'the unpacked binary did not verify; the download was removed, retry to download again'
+  try {
+    const got = await download($, m, p.url, p.tmp, p.file.size, bytes => running('download', bytes))
+    if (got !== 'ok') return got
+
+    await running('verify', p.file.size)
+    const hash = await sha256($, m, p.tmp)
+    if (hash === null) return 'could not compute the checksum of the download; it is kept, retry checks it again'
+    if (hash !== p.file.checksum) {
+      await run($, m.cmd.remove(p.tmp))
+      return 'checksum mismatch on the download; it was removed, retry to download again'
     }
-    await removeFiles($, m, p.tmp)
-  }
 
-  return (await moveInto($, m, unpacked, p.out)) || 'ok'
+    let unpacked = p.tmp
+    if (p.file !== p.raw) {
+      await running('unpack', p.file.size)
+      unpacked = join(m, versionsDir(m), `.${v}.${m.plat}.unpacked`)
+      const isUnpacked = (await run($, m.cmd.unpack(p.tmp, unpacked), 300_000)).exitCode === 0
+      if (!isUnpacked || (await sha256($, m, unpacked)) !== p.raw.checksum) {
+        // The download verified, so it stays: a retry unpacks it again.
+        await run($, m.cmd.remove(unpacked))
+        return 'unpacking did not give the expected binary (is the disk full?); the download is kept, retry unpacks it again'
+      }
+      await run($, m.cmd.remove(p.tmp))
+    }
+
+    const moved = await run($, m.cmd.move(unpacked, p.out))
+    return moved.exitCode === 0 ? 'ok' : moved.stderr.trim() || 'could not move the binary into place'
+  } finally {
+    await run($, m.cmd.unlock(`${p.tmp}.lock`))
+  }
+}
+
+// Removes what this mod left in the versions folder for other versions.
+async function cleanUp($: EngineInterface, m: Machine): Promise<void> {
+  const entries = await $.fs.list(versionsDir(m)).catch(() => [])
+  for (const e of entries) {
+    if (e.kind === 'file' && LEFTOVER.test(e.name)) await run($, m.cmd.remove(join(m, versionsDir(m), e.name)))
+  }
 }
 
 // Runs `claude install <v>` and resolves its exit code and last line.
-async function install($: EngineInterface, h: Host, v: string): Promise<{ code: number | null; line: string }> {
-  const bin = h.os !== 'other' && (await $.fs.exists(claudeBin(h))) ? claudeBin(h) : 'claude'
+async function install($: EngineInterface, m: Host, v: string): Promise<{ code: number | null; line: string }> {
+  const bin = m !== null && (await $.fs.exists(m.launcher)) ? m.launcher : 'claude'
   const child = $.process.spawn({ argv: [bin, 'install', v] })
   let line = ''
 
@@ -458,61 +548,75 @@ async function install($: EngineInterface, h: Host, v: string): Promise<{ code: 
   return { code: ended.code, line }
 }
 
-async function runUpgrade($: EngineInterface, n: Notice): Promise<void> {
-  const v = n.target
-  isCancelled = false
+async function runUpgrade($: EngineInterface, v: string): Promise<void> {
   const failed = (line: string) => update($, upgrade, () => ({ phase: 'failed', version: v, line }))
 
   try {
-    const h = await getHost($)
-    if (h.os !== 'other') {
-      const got = await fetchBinary($, h, v)
+    const m = await getHost($)
+    if (m !== null) {
+      const got = await fetchBinary($, m, v)
       if (got === 'cancelled') return void (await failed('Cancelled. What was downloaded is kept; retry resumes it.'))
       if (got !== 'ok') return void (await failed(got))
     }
 
-    await update($, upgrade, () => ({
-      phase: 'running',
-      version: v,
-      stage: 'install',
-      doneMiB: 0,
-      totalMiB: 0,
-      line: `claude install ${v}`,
-    }))
+    await update($, upgrade, u =>
+      u?.phase === 'running' ? { ...u, stage: 'install', line: `claude install ${v}`, isCancelling: false } : u,
+    )
     // The installer reuses the binary placed here, leaving its mtime as it was.
     // A changed mtime means it downloaded the binary again.
-    const placed = h.os === 'other' ? null : join(h, versionsDir(h), v)
-    const mtime = async () => (placed ? $.fs.stat(placed).then(s => s.mtimeMs, () => -1) : -1)
-    const before = await mtime()
-    const { code, line } = await install($, h, v)
-    const isRedownloaded = before !== -1 && (await mtime()) !== before
-    await update($, upgrade, () =>
-      code === 0 ? { phase: 'done', version: v, isRedownloaded } : { phase: 'failed', version: v, line: line || `claude install exited with ${code}` },
-    )
+    const placed = m === null ? null : join(m, versionsDir(m), v)
+    const before = placed ? await mtimeOf($, placed) : null
+    const { code, line } = await install($, m, v)
+    if (code !== 0) return void (await failed(line || `claude install exited with ${code}`))
+
+    const isRedownloaded = placed !== null && before !== null && (await mtimeOf($, placed)) !== before
+    await $.store.set('installed', v)
+    if (m !== null) await cleanUp($, m)
+    await update($, upgrade, () => ({ phase: 'done', version: v, isRedownloaded }))
   } catch (err) {
     await failed(String(err))
   }
 }
 
 function runningText(u: Upgrade & { phase: 'running' }): string {
+  if (u.isCancelling) return 'Cancelling… (up to 30 s while the connection is stalled)'
+  if (u.stage === 'prepare') return 'Preparing…'
   if (u.stage === 'download') return `Downloading ${u.doneMiB.toFixed(1)} / ${u.totalMiB.toFixed(1)} MiB`
   if (u.stage === 'verify') return 'Verifying checksum…'
   if (u.stage === 'unpack') return 'Unpacking…'
   return `Installing… ${u.line}`
 }
 
+function sizeText(downloadMiB: number | null, isCompressed: boolean): string {
+  if (downloadMiB === null) return 'Download size unknown.'
+  if (downloadMiB === 0) return 'Already downloaded.'
+  const size = downloadMiB.toFixed(downloadMiB < 10 ? 1 : 0)
+  return `Downloads ${size} MiB${isCompressed ? ' (zstd)' : ''}, resumable.`
+}
+
 export const register: Register = (on, options) => {
   channel = options.channel === 'latest' ? 'latest' : 'stable'
 
   on('session.start', async ($, e, next) => {
+    // A reload drops the running download with the old module: say so, so
+    // the row offers Retry instead of a progress line nothing moves.
+    await update($, upgrade, u =>
+      u?.phase === 'running' || u?.phase === 'preparing'
+        ? { phase: 'failed', version: u.version, line: 'Interrupted when the mod reloaded. Retry resumes the download.' }
+        : u,
+    )
     await $.command.register({
       name: 'check-update',
       description: 'Check for a new Claude Code release now (and stop skipping any version)',
     })
-    void check($).catch(() => undefined)
-    $.clock.every(CHECK_EVERY_MS, () => {
+
+    // `claude -p` and SDK runs show no band: they would only spend the toast.
+    if (e.isInteractive) {
       void check($).catch(() => undefined)
-    })
+      $.clock.every(CHECK_EVERY_MS, () => {
+        void check($).catch(() => undefined)
+      })
+    }
 
     return next(e)
   })
@@ -534,14 +638,17 @@ export const register: Register = (on, options) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const u = await read($, upgrade)
     const s = await read($, summary)
-    const v = n.target
     const room = Math.max(20, e.props.bodyColumns - 30)
     const close = async () => {
       await update($, upgrade, () => null)
       await update($, notice, () => null)
     }
+    const skip = async () => {
+      await $.store.set('skipped', n.target)
+      await close()
+    }
     const whatsNew =
-      s?.to === v && s.status !== 'pending' ? (
+      s?.to === n.target && s.status !== 'pending' ? (
         <Button key="news" label="What's new" onPress={() => $.ui.open({ id: PANE, title: `Claude Code ${s.from} → ${s.to}` })} />
       ) : (
         <Text dimColor>Summarizing changes…</Text>
@@ -554,30 +661,26 @@ export const register: Register = (on, options) => {
           <Text>Installed by a package manager: run `claude update`. </Text>
           {whatsNew}
           <Text> </Text>
-          <Button key="skip" label="Skip this version" onPress={async () => { await $.store.set('skipped', v); await close() }} />
+          <Button key="skip" label="Skip this version" onPress={skip} />
         </Box>
       )
     } else if (u === null) {
       row = (
         <Box>
-          <Button key="upgrade" label="Upgrade" variant="primary" onPress={() => askConfirm($, n)} />
+          <Button key="upgrade" label="Upgrade" variant="primary" onPress={() => askConfirm($, n.target)} />
           <Text> </Text>
           {whatsNew}
           <Text> </Text>
-          <Button key="skip" label="Skip this version" onPress={async () => { await $.store.set('skipped', v); await close() }} />
+          <Button key="skip" label="Skip this version" onPress={skip} />
         </Box>
       )
+    } else if (u.phase === 'preparing') {
+      row = <Text dimColor>Checking the download size of {u.version}…</Text>
     } else if (u.phase === 'confirm') {
-      const size =
-        u.downloadMiB === null
-          ? 'Download size unknown.'
-          : u.downloadMiB === 0
-            ? 'Already downloaded.'
-            : `Downloads ${u.downloadMiB.toFixed(0)} MiB${u.isCompressed ? ' (zstd)' : ''}, resumable.`
       row = (
         <Box>
-          <Text>Install {v}? {size} </Text>
-          <Button key="confirm" label="Install" variant="primary" onPress={() => { $.clock.after(1, () => void runUpgrade($, n)) }} />
+          <Text>Install {u.version}? {sizeText(u.downloadMiB, u.isCompressed)} </Text>
+          <Button key="confirm" label="Install" variant="primary" onPress={() => startUpgrade($, u.version)} />
           <Text> </Text>
           <Button key="cancel" label="Cancel" onPress={() => update($, upgrade, () => null)} />
         </Box>
@@ -586,8 +689,8 @@ export const register: Register = (on, options) => {
       row = (
         <Box>
           <Text color="cyan">{runningText(u).slice(0, room)} </Text>
-          {u.stage === 'download' && (
-            <Button key="abort" label="Cancel" onPress={() => { isCancelled = true }} />
+          {(u.stage === 'prepare' || u.stage === 'download') && !u.isCancelling && (
+            <Button key="abort" label="Cancel" onPress={() => cancelUpgrade($)} />
           )}
         </Box>
       )
@@ -595,7 +698,7 @@ export const register: Register = (on, options) => {
       row = (
         <Box flexDirection="column">
           <Box>
-            <Text color="green">✓ Installed {v}. Restart claude to use it. </Text>
+            <Text color="green">✓ Installed {u.version}. Restart claude to use it. </Text>
             <Button key="close" label="Close" onPress={close} />
           </Box>
           {u.isRedownloaded && (
@@ -610,7 +713,7 @@ export const register: Register = (on, options) => {
       row = (
         <Box>
           <Text color="red">✗ Upgrade stopped: {u.line.slice(0, room)} </Text>
-          <Button key="retry" label="Retry" variant="primary" onPress={() => { $.clock.after(1, () => void runUpgrade($, n)) }} />
+          <Button key="retry" label="Retry" variant="primary" onPress={() => startUpgrade($, u.version)} />
           <Text> </Text>
           <Button key="close" label="Close" onPress={close} />
         </Box>
@@ -620,7 +723,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column">
         <Text color="yellow">
-          ⬆ Claude Code {v} is available on {channel} (you have {n.current})
+          ⬆ Claude Code {n.target} is available on {channel} (you have {n.current})
         </Text>
         {row}
       </Box>

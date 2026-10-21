@@ -1,14 +1,17 @@
 export type Notice = { target: string; current: string; isNative: boolean }
 
 export type Upgrade =
+  // Upgrade was pressed; the download size is being worked out.
+  | { phase: 'preparing'; version: string }
   | { phase: 'confirm'; version: string; downloadMiB: number | null; isCompressed: boolean }
   | {
       phase: 'running'
       version: string
-      stage: 'download' | 'verify' | 'unpack' | 'install'
+      stage: 'prepare' | 'download' | 'verify' | 'unpack' | 'install'
       doneMiB: number
       totalMiB: number
       line: string
+      isCancelling: boolean
     }
   // isRedownloaded: claude install replaced the binary this mod placed, so the
   // resumable download saved nothing this time.

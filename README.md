@@ -54,11 +54,14 @@ At the prompt of a terminal session:
    without `zstd`, into the installer's versions folder,
    `$XDG_DATA_HOME/claude/versions/` (by default `~/.local/share/claude/versions/`,
    `%USERPROFILE%\.local\share\claude\versions\` on Windows), as
-   `.<version>.<platform>[.zst].partial`. A partial file already there is resumed.
+   `.<version>.<platform>[.zst].partial`. A partial file already there is resumed,
+   and a lock keeps two Claude Code sessions from downloading the same version
+   at once.
 3. Checks the download's SHA-256 against the manifest, unpacks it, and checks
    the unpacked binary's SHA-256 too. A file that fails a check is deleted.
 4. Moves it to `<version>` in that folder (marked executable on macOS and
-   Linux) and runs `claude install <version>`.
+   Linux) and runs `claude install <version>`. Once it succeeds, partial files
+   left from other versions are removed.
 
 Installs made by a package manager (Homebrew, npm, WinGet) get the notice and
 the summary but no Upgrade button. The band tells you to run `claude update`.
