@@ -16,13 +16,15 @@ Claude Code 自带的安装器（截至 2.1.304）下载失败后会从头重新
 
 ## 安装
 
-需要 **Claude Code 2.1.287 或更高版本**（mod 机制从这个版本开始提供），更早的版本无法加载本 mod。可以用 `claude --version` 查看当前版本；如果低于这个版本，请先手动升级一次：`claude install stable`。
+需要 **Claude Code 2.1.287 或更高版本**（mod 机制从这个版本开始提供），更早的版本无法加载本 mod。可以用 `claude --version` 查看当前版本；如果低于这个版本，请先手动升级一次：`claude install stable`。桌面 App 和 VS Code 里看的是它们自带那份的版本，可以用 `/status` 查看，需要通过更新 App 或插件来升级。
 
 然后在终端会话的输入框中输入：
 
 ```
 /plugin install cc-resumable-update --marketplace liuchengwucn/cc-resumable-update
 ```
+
+桌面 App 里不能运行 `/plugin`：点击输入框旁的 **+**，依次选择 **Plugins**、**Add marketplace**，填入 `liuchengwucn/cc-resumable-update`，再选择 **Add plugin**。VS Code 里输入 `/plugins` 打开 **Manage plugins**。
 
 ## 使用
 
@@ -34,6 +36,17 @@ Claude Code 自带的安装器（截至 2.1.304）下载失败后会从头重新
 | 配置项 | 可选值 | 默认值 |
 | --- | --- | --- |
 | `channel` | `stable`、`latest` | `stable` |
+
+## 适用环境
+
+| Claude Code 运行在哪里 | 提醒与摘要 | Upgrade 按钮 |
+| --- | --- | --- |
+| 终端（`claude`），包括在 IDE 终端里运行它的 JetBrains 插件 | 支持 | native 安装支持；包管理器安装会提示运行 `claude update` |
+| 桌面 App 的 Code 标签页 | 支持 | 不提供：App 运行的是它自带的那份 Claude Code，随 App 更新（Check for Updates…），横幅会给出相应提示 |
+| VS Code 插件（2.1.299 及以上才能显示横幅） | 支持 | 不提供：插件自带一份 Claude Code，随插件更新，横幅会给出相应提示 |
+| `claude -p` 和 Agent SDK 运行 | 不检查：这类会话没有界面 | 不提供 |
+
+桌面 App 的 WSL 会话不支持插件。桌面 App 和 VS Code 通过各自的插件管理界面安装插件，而不是 `/plugin` 命令。
 
 ## 升级流程
 

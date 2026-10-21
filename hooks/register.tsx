@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Notice, Summary, Upgrade } from '../types'
+import type { Notice, Runner, Summary, Upgrade } from '../types'
 
 const RELEASES = 'https://downloads.claude.ai/claude-code-releases'
 const CHANGELOG_URL = 'https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md'
@@ -112,6 +112,9 @@ let isUpgrading = false
 let isCancelled = false
 // The plan Upgrade worked out, reused by Install.
 let planned: Plan | null = null
+// Which copy of Claude Code runs this session, once a surface shows it; null
+// until then (and for good in a `claude -p` run).
+let runner: 'cli' | Exclude<Runner, 'native' | 'package-manager'> | null = null
 
 function isNewer(a: string, b: string): boolean {
   const x = a.split('.').map(Number)
@@ -263,8 +266,10 @@ async function runCheck($: EngineInterface): Promise<string> {
   }
 
   const m = await getHost($)
+  const isCli = runner === 'cli'
   // Installed by this mod and waiting for a restart: nothing more to offer.
   const isInstalled =
+    isCli &&
     m !== null &&
     (await $.store.get('installed')) === target &&
     (await $.fs.exists(join(m, versionsDir(m), target)).catch(() => false))
@@ -279,7 +284,8 @@ async function runCheck($: EngineInterface): Promise<string> {
   }
 
   const isNative = m === null || (await $.fs.exists(join(m, versionsDir(m), current)).catch(() => false))
-  await setNotice($, { target, current, isNative })
+  const kind: Runner = isCli ? (isNative ? 'native' : 'package-manager') : runner ?? 'app'
+  await setNotice($, { target, current, runner: kind })
   $.clock.after(1, () => {
     void summarize($, current, target)
   })
@@ -579,6 +585,33 @@ async function runUpgrade($: EngineInterface, v: string): Promise<void> {
   }
 }
 
+// What the band says in place of Upgrade where the mod cannot upgrade the copy
+// of Claude Code that runs the session.
+const HOW_TO_GET: Record<Exclude<Runner, 'native'>, string> = {
+  'package-manager': 'Installed by a package manager: run `claude update`.',
+  desktop:
+    'The desktop app runs its own copy of Claude Code: Check for Updates… in the Claude menu (macOS) or Help menu (Windows); it may come with a later app update.',
+  vscode: 'The VS Code extension runs its own copy of Claude Code: update the extension; it may come with a later extension update.',
+  app: 'The app running this session has its own copy of Claude Code: update the app to get it.',
+}
+
+// Starts checking once a person can see the band: at once under the terminal
+// REPL, else when the desktop app or VS Code attaches. `claude -p` and SDK runs
+// draw nowhere and never check, so they do not spend the one-time toast.
+async function startChecks($: EngineInterface): Promise<void> {
+  if (runner !== null) return
+  const surfaces = await $.session.surfaces()
+  if (surfaces.length === 0) return
+
+  const first = surfaces[0]
+  // The terminal REPL is the CLI itself; any other host is an app with its own copy.
+  runner = first === 'terminal' ? 'cli' : first === 'desktop' ? 'desktop' : first === 'vscode' ? 'vscode' : 'app'
+  void check($).catch(() => undefined)
+  $.clock.every(CHECK_EVERY_MS, () => {
+    void check($).catch(() => undefined)
+  })
+}
+
 function runningText(u: Upgrade & { phase: 'running' }): string {
   if (u.isCancelling) return 'Cancelling… (up to 30 s while the connection is stalled)'
   if (u.stage === 'prepare') return 'Preparing…'
@@ -610,20 +643,21 @@ export const register: Register = (on, options) => {
       name: 'check-update',
       description: 'Check for a new Claude Code release now (and stop skipping any version)',
     })
+    await startChecks($)
 
-    // `claude -p` and SDK runs show no band: they would only spend the toast.
-    if (e.isInteractive) {
-      void check($).catch(() => undefined)
-      $.clock.every(CHECK_EVERY_MS, () => {
-        void check($).catch(() => undefined)
-      })
-    }
+    return next(e)
+  })
+
+  // The desktop app and the VS Code extension attach after the session starts.
+  on('session.attach', async ($, e, next) => {
+    await startChecks($)
 
     return next(e)
   })
 
   on('command.run', { command: 'check-update' }, async $ => {
     await $.store.delete('skipped')
+    await startChecks($)
     const text = await check($).catch(err => `Check failed: ${String(err)}`)
 
     return { text }
@@ -656,10 +690,10 @@ export const register: Register = (on, options) => {
       )
 
     let row
-    if (u === null && !n.isNative) {
+    if (u === null && n.runner !== 'native') {
       row = (
         <Box>
-          <Text>Installed by a package manager: run `claude update`. </Text>
+          <Text>{HOW_TO_GET[n.runner]} </Text>
           {whatsNew}
           <Text> </Text>
           <Button key="skip" label="Skip this version" onPress={skip} />

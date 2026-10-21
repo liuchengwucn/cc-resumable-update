@@ -29,13 +29,19 @@ the verified binary without downloading it again.
 
 Needs **Claude Code 2.1.287 or later**, the release that added mods; an older
 one cannot load this mod at all. Check with `claude --version`, and if yours is
-older, upgrade once by hand first: `claude install stable`.
+older, upgrade once by hand first: `claude install stable`. In the desktop app
+or VS Code, the version is that of the app's own copy: `/status` shows it, and
+the app or extension update brings a newer one.
 
 Then, at the prompt of a terminal session:
 
 ```
 /plugin install cc-resumable-update --marketplace liuchengwucn/cc-resumable-update
 ```
+
+In the desktop app, where `/plugin` does not run: click **+** next to the prompt
+box, then **Plugins**, **Add marketplace** with `liuchengwucn/cc-resumable-update`,
+then **Add plugin**. In VS Code, type `/plugins` to open **Manage plugins**.
 
 ## Use
 
@@ -49,6 +55,18 @@ Then, at the prompt of a terminal session:
 | Option | Values | Default |
 | --- | --- | --- |
 | `channel` | `stable`, `latest` | `stable` |
+
+## Where it works
+
+| Where Claude Code runs | Notice and summary | Upgrade button |
+| --- | --- | --- |
+| Terminal (`claude`), including JetBrains, which runs it in the IDE's terminal | Yes | Yes, for a native install; a package manager's install is told to run `claude update` |
+| Desktop app, Code tab | Yes | No: the app runs its own copy of Claude Code, updated with the app (Check for Updates…), and the band says so |
+| VS Code extension (2.1.299 or later to draw the band) | Yes | No: the extension bundles its own copy, updated with the extension, and the band says so |
+| `claude -p` and Agent SDK runs | No: they draw nowhere, so the mod does not check | No |
+
+Plugins are not available in the desktop app's WSL sessions. The desktop app
+and VS Code install plugins from their own plugin screens rather than `/plugin`.
 
 ## How the upgrade works
 

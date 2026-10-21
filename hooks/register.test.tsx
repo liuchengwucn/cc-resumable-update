@@ -75,6 +75,8 @@ type World = {
   curlEnds: number[]
   fetched: string[]
   model: { system: string; prompt: string; model: string }[]
+  // What $.session.surfaces() answers: the terminal REPL unless a test says otherwise.
+  surfaces: string[]
 }
 
 // Stands in for the engine and the machine: a native install of 2.1.304 on
@@ -92,6 +94,7 @@ function world(on: any, o: Options): World {
     curlEnds: [ZST.size],
     fetched: [],
     model: [],
+    surfaces: ['terminal'],
   }
   if (o.locked) w.files.set(ZTMP, 10 * 1024 * 1024)
   const mtimes = new Map<string, number>()
@@ -100,6 +103,8 @@ function world(on: any, o: Options): World {
   mock.env(on, { HOME })
   on('command.register', () => ({ value: { command: 'check-update' } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('session.surfaces', () => ({ value: w.surfaces }))
+  on('session.attach', (_: unknown, e: { clientId: string }) => ({ clientId: e.clientId }))
   on('session.version', () => ({ value: { version: '2.1.304', base: '2.1.304' } }))
   on('ui.toast', (_: unknown, e: { text: string }) => {
     w.toasts.push(e.text)
@@ -193,9 +198,10 @@ function world(on: any, o: Options): World {
   return w
 }
 
-const start = async ($: any, isInteractive = true) => {
-  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive })
-  if (isInteractive) await $.command.run({ command: 'check-update', args: '' })
+// Starts a session drawn on `surface` (null: a `claude -p` run) and checks once.
+const start = async ($: any, surface: 'terminal' | null = 'terminal') => {
+  await $.session.start({ cwd: '/', surface, isInteractive: surface !== null })
+  if (surface !== null) await $.command.run({ command: 'check-update', args: '' })
 }
 
 // Presses Upgrade then Install, and lets the upgrade run to its end.
@@ -389,7 +395,8 @@ test('a changelog that cannot be fetched ends the summary as failed, not pending
 test('a non-interactive session does not check', STABLE, async ($, on) => {
   const clock = mock.clock(on)
   const w = world(on, { stable: '2.1.310' })
-  await start($, false)
+  w.surfaces = []
+  await start($, null)
   await clock.settle()
 
   expect(w.fetched).toEqual([])
@@ -422,6 +429,7 @@ test('on Windows the plain build downloads with curl.exe and moves into place th
 
   mock.store(on)
   mock.env(on, { USERPROFILE: WHOME, OS: 'Windows_NT', PROCESSOR_ARCHITECTURE: 'AMD64' })
+  on('session.surfaces', () => ({ value: ['terminal'] }))
   on('command.register', () => ({ value: { command: 'check-update' } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('session.version', () => ({ value: { version: '2.1.304', base: '2.1.304' } }))
@@ -499,3 +507,31 @@ test('on Windows the plain build downloads with curl.exe and moves into place th
   expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
   await ui.unmount()
 })
+
+for (const [surface, name, hint] of [
+  ['desktop', 'the desktop app', /desktop app runs its own copy.*Check for Updates/],
+  ['vscode', 'the VS Code extension', /VS Code extension runs its own copy.*update the extension/],
+] as const) {
+  test(`in ${name} the band points at its update, with no Upgrade button`, STABLE, async ($, on) => {
+    const clock = mock.clock(on)
+    const w = world(on, { stable: '2.1.310' })
+    // The app's session starts drawing nowhere; its client attaches after.
+    w.surfaces = []
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false })
+    await clock.settle()
+    expect(w.fetched).toEqual([])
+
+    w.surfaces = [surface]
+    await $.session.attach({ surface, clientId: `${surface}:default` })
+    await clock.advance(10)
+    await clock.settle()
+
+    const ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ type: 'Text', text: /2\.1\.310 is available on stable/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: hint })).toBeDefined()
+    expect(await ui.find({ type: 'Button', key: 'upgrade' })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', key: 'news' })).toBeDefined()
+    expect(await ui.find({ type: 'Button', key: 'skip' })).toBeDefined()
+    await ui.unmount()
+  })
+}
