@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code (native)
+        run: curl -fsSL https://claude.ai/install.sh | bash
+      - name: Validate
+        run: ~/.local/bin/claude plugin validate .
+      - name: Test
+        run: ~/.local/bin/claude plugin test .

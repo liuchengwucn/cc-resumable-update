@@ -21,21 +21,25 @@ const summary = atom({ plugin: 'cc-resumable-update', key: 'summary' } as const,
 type Channel = 'stable' | 'latest'
 
 // Where the native installer keeps versions, and the tools found on this machine.
-// `other` covers Windows and any system without `uname`: it upgrades through
-// `claude install` alone, without a resumable download.
-type Host =
-  | {
-      os: 'unix'
-      plat: string
-      home: string
-      // $XDG_DATA_HOME, or ~/.local/share: where the installer keeps claude/versions.
-      data: string
-      hasZstd: boolean
-      sha: readonly string[]
-    }
-  | { os: 'other' }
+type Machine = {
+  os: 'unix' | 'windows'
+  plat: string
+  home: string
+  // $XDG_DATA_HOME, or ~/.local/share: where the installer keeps claude/versions.
+  data: string
+  hasZstd: boolean
+  sha: readonly string[]
+}
 
-type Entry = { checksum: string; size: number }
+// `other` is a system neither probe recognized: it upgrades through
+// `claude install` alone, without a resumable download.
+type Host = Machine | { os: 'other' }
+
+// Windows file operations go through PowerShell, their paths through the
+// environment (CRU_A, CRU_B), so no path needs quoting.
+const PS = ['powershell', '-NoProfile', '-NonInteractive', '-Command'] as const
+
+type Entry = { binary: string; checksum: string; size: number }
 
 let channel: Channel = 'stable'
 let host: Host | null = null
@@ -50,10 +54,6 @@ function isNewer(a: string, b: string): boolean {
     if (x[i] !== y[i]) return x[i] > y[i]
   }
   return false
-}
-
-function mib(bytes: number): string {
-  return (bytes / MiB).toFixed(bytes < 10 * MiB ? 1 : 0)
 }
 
 function after($: EngineInterface, ms: number): Promise<void> {
@@ -74,7 +74,7 @@ async function getHost($: EngineInterface): Promise<Host> {
   }
   const [sys, mach] = uname.split(/\s+/)
   if (sys !== 'Linux' && sys !== 'Darwin') {
-    host = { os: 'other' }
+    host = await getWindows($)
     return host
   }
 
@@ -100,16 +100,51 @@ async function getHost($: EngineInterface): Promise<Host> {
   return host
 }
 
-function versionsDir(h: Host & { os: 'unix' }): string {
-  return `${h.data}/claude/versions`
+// Windows has no `uname`; PowerShell answers the same questions there.
+async function getWindows($: EngineInterface): Promise<Host> {
+  let lines: string[] = []
+  try {
+    const r = await $.process.run([
+      ...PS,
+      "$env:USERPROFILE; if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $env:USERPROFILE '.local\\share' }; " +
+        '"$env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_ARCHITEW6432"; ' +
+        "if (Get-Command zstd -ErrorAction SilentlyContinue) { 'zstd' }",
+    ])
+    if (r.exitCode === 0) lines = r.stdout.split(/\r?\n/).map(s => s.trim())
+  } catch {
+    lines = []
+  }
+  const [home, data, arch, ...flags] = lines
+  if (!home || !data) return { os: 'other' }
+
+  return {
+    os: 'windows',
+    plat: `win32-${/ARM64/i.test(arch ?? '') ? 'arm64' : 'x64'}`,
+    home,
+    data,
+    hasZstd: flags.includes('zstd'),
+    sha: [],
+  }
+}
+
+function join(m: Machine, ...parts: string[]): string {
+  return parts.join(m.os === 'windows' ? '\\' : '/')
+}
+
+function versionsDir(m: Machine): string {
+  return join(m, m.data, 'claude', 'versions')
+}
+
+function claudeBin(m: Machine): string {
+  return m.os === 'windows' ? join(m, m.home, '.local', 'bin', 'claude.exe') : join(m, m.home, '.local', 'bin', 'claude')
 }
 
 async function entryOf($: EngineInterface, url: string, plat: string): Promise<Entry | null> {
   const res = await $.http.fetch(url)
   if (!res.ok) return null
   const p = JSON.parse(res.text)?.platforms?.[plat]
-  return typeof p?.checksum === 'string' && typeof p?.size === 'number'
-    ? { checksum: p.checksum, size: p.size }
+  return typeof p?.binary === 'string' && typeof p?.checksum === 'string' && typeof p?.size === 'number'
+    ? { binary: p.binary, checksum: p.checksum, size: p.size }
     : null
 }
 
@@ -117,23 +152,74 @@ async function sizeOf($: EngineInterface, path: string): Promise<number> {
   return $.fs.stat(path).then(s => s.size, () => 0)
 }
 
-async function sha256($: EngineInterface, h: Host & { os: 'unix' }, path: string): Promise<string> {
-  const r = await $.process.run([...h.sha, path], { timeoutMs: 300_000 })
-  return r.exitCode === 0 ? r.stdout.trim().split(/\s+/)[0] : ''
+async function sha256($: EngineInterface, m: Machine, path: string): Promise<string> {
+  const r =
+    m.os === 'windows'
+      ? await $.process.run([...PS, '(Get-FileHash -Algorithm SHA256 -LiteralPath $env:CRU_A).Hash'], {
+          env: { CRU_A: path },
+          timeoutMs: 300_000,
+        })
+      : await $.process.run([...m.sha, path], { timeoutMs: 300_000 })
+  return r.exitCode === 0 ? r.stdout.trim().split(/\s+/)[0].toLowerCase() : ''
+}
+
+async function makeDir($: EngineInterface, m: Machine, dir: string): Promise<void> {
+  await (m.os === 'windows'
+    ? $.process.run([...PS, 'New-Item -ItemType Directory -Force -Path $env:CRU_A | Out-Null'], { env: { CRU_A: dir } })
+    : $.process.run(['mkdir', '-p', dir]))
+}
+
+async function removeFiles($: EngineInterface, m: Machine, ...paths: string[]): Promise<void> {
+  if (m.os !== 'windows') {
+    await $.process.run(['rm', '-f', ...paths])
+    return
+  }
+  for (const path of paths) {
+    await $.process.run([...PS, 'Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $env:CRU_A'], {
+      env: { CRU_A: path },
+    })
+  }
+}
+
+async function unpack($: EngineInterface, m: Machine, src: string, dst: string): Promise<boolean> {
+  // On Unix through redirection, not path arguments: some zstd wrappers do not map paths.
+  const r =
+    m.os === 'windows'
+      ? await $.process.run(['zstd', '-q', '-d', '-f', src, '-o', dst], { timeoutMs: 300_000 })
+      : await $.process.run(['sh', '-c', 'zstd -q -d <"$1" >"$2"', '_', src, dst], { timeoutMs: 300_000 })
+  return r.exitCode === 0
+}
+
+// Moves the verified binary into place. The installer takes a retained version
+// only when it is executable, hence the chmod on Unix.
+async function moveInto($: EngineInterface, m: Machine, src: string, dst: string): Promise<string> {
+  const r =
+    m.os === 'windows'
+      ? await $.process.run([...PS, 'Move-Item -Force -LiteralPath $env:CRU_A -Destination $env:CRU_B'], {
+          env: { CRU_A: src, CRU_B: dst },
+        })
+      : await $.process.run(['sh', '-c', 'mv -f "$1" "$2" && chmod 755 "$2"', '_', src, dst])
+  return r.exitCode === 0 ? '' : r.stderr.trim() || 'could not move the binary into place'
 }
 
 // The download a confirm names: the compressed build when zstd is here.
-async function plan($: EngineInterface, h: Host & { os: 'unix' }, v: string) {
-  const raw = await entryOf($, `${RELEASES}/${v}/manifest.json`, h.plat)
-  if (raw === null) throw new Error(`no ${h.plat} build listed for ${v}`)
-  const zst = h.hasZstd ? await entryOf($, `${RELEASES}/${v}/manifest.zst.json`, h.plat) : null
-  const dir = versionsDir(h)
-  const out = `${dir}/${v}`
-  const isReady = (await sizeOf($, out)) === raw.size && (await sha256($, h, out)) === raw.checksum
+async function plan($: EngineInterface, m: Machine, v: string) {
+  const raw = await entryOf($, `${RELEASES}/${v}/manifest.json`, m.plat)
+  if (raw === null) throw new Error(`no ${m.plat} build listed for ${v}`)
+  const zst = m.hasZstd ? await entryOf($, `${RELEASES}/${v}/manifest.zst.json`, m.plat) : null
+  const dir = versionsDir(m)
+  const out = join(m, dir, v)
+  const isReady = (await sizeOf($, out)) === raw.size && (await sha256($, m, out)) === raw.checksum
+  const file = zst ?? raw
 
-  return zst
-    ? { raw, out, isReady, file: zst, url: `${RELEASES}/${v}/${h.plat}/claude.zst`, tmp: `${dir}/.${v}.${h.plat}.zst.partial` }
-    : { raw, out, isReady, file: raw, url: `${RELEASES}/${v}/${h.plat}/claude`, tmp: `${dir}/.${v}.${h.plat}.partial` }
+  return {
+    raw,
+    out,
+    isReady,
+    file,
+    url: `${RELEASES}/${v}/${m.plat}/${file.binary}`,
+    tmp: join(m, dir, `.${v}.${m.plat}${zst ? '.zst' : ''}.partial`),
+  }
 }
 
 // Checks the channel against the running version; resolves a one-line summary.
@@ -168,7 +254,7 @@ async function runCheck($: EngineInterface): Promise<string> {
 
   const h = await getHost($)
   const isNative =
-    h.os === 'other' || (await $.fs.exists(`${versionsDir(h)}/${current}`).catch(() => false))
+    h.os === 'other' || (await $.fs.exists(join(h, versionsDir(h), current)).catch(() => false))
   await setNotice($, { target, current, isNative })
   $.clock.after(1, () => {
     void summarize($, current, target).catch(() => undefined)
@@ -249,7 +335,7 @@ async function askConfirm($: EngineInterface, n: Notice): Promise<void> {
   let downloadMiB: number | null = null
   let isCompressed = false
 
-  if (h.os === 'unix') {
+  if (h.os !== 'other') {
     try {
       const p = await plan($, h, v)
       isCompressed = p.file !== p.raw
@@ -266,6 +352,7 @@ async function askConfirm($: EngineInterface, n: Notice): Promise<void> {
 // Resolves `ok`, `cancelled`, or why it gave up.
 async function download(
   $: EngineInterface,
+  m: Machine,
   url: string,
   tmp: string,
   size: number,
@@ -282,7 +369,7 @@ async function download(
     // exits and the next attempt resumes. --progress-bar keeps chunks coming,
     // which is when the loop redraws and sees a cancel.
     const child = $.process.spawn({
-      argv: ['curl', '-fL', '-C', '-', '--speed-limit', '1024', '--speed-time', '30', '--progress-bar', '-o', tmp, url],
+      argv: [m.os === 'windows' ? 'curl.exe' : 'curl', '-fL', '-C', '-', '--speed-limit', '1024', '--speed-time', '30', '--progress-bar', '-o', tmp, url],
     })
     let lastDrawn = 0
     let error = ''
@@ -315,53 +402,47 @@ async function download(
 
 // Leaves a verified binary at `versions/<v>`, where `claude install <v>` takes it
 // as already downloaded. Resolves `ok`, `cancelled`, or why it stopped.
-async function fetchBinary($: EngineInterface, h: Host & { os: 'unix' }, v: string): Promise<string> {
-  const p = await plan($, h, v)
+async function fetchBinary($: EngineInterface, m: Machine, v: string): Promise<string> {
+  const p = await plan($, m, v)
   if (p.isReady) return 'ok'
 
-  const running = (stage: 'download' | 'verify' | 'unpack', done: number, line: string) =>
+  const running = (stage: 'download' | 'verify' | 'unpack', done: number) =>
     update($, upgrade, () => ({
       phase: 'running',
       version: v,
       stage,
       doneMiB: done / MiB,
       totalMiB: p.file.size / MiB,
-      line,
+      line: '',
     }))
 
-  await $.process.run(['mkdir', '-p', versionsDir(h)])
-  const got = await download($, p.url, p.tmp, p.file.size, bytes => running('download', bytes, ''))
+  await makeDir($, m, versionsDir(m))
+  const got = await download($, m, p.url, p.tmp, p.file.size, bytes => running('download', bytes))
   if (got !== 'ok') return got
 
-  await running('verify', p.file.size, '')
-  if ((await sha256($, h, p.tmp)) !== p.file.checksum) {
-    await $.process.run(['rm', '-f', p.tmp])
+  await running('verify', p.file.size)
+  if ((await sha256($, m, p.tmp)) !== p.file.checksum) {
+    await removeFiles($, m, p.tmp)
     return 'checksum mismatch on the download; it was removed, retry to download again'
   }
 
   let unpacked = p.tmp
   if (p.file !== p.raw) {
-    await running('unpack', p.file.size, '')
-    unpacked = `${versionsDir(h)}/.${v}.${h.plat}.unpacked`
-    // Through redirection, not path arguments: some zstd wrappers do not map paths.
-    const z = await $.process.run(['sh', '-c', 'zstd -q -d <"$1" >"$2"', '_', p.tmp, unpacked], {
-      timeoutMs: 300_000,
-    })
-    if (z.exitCode !== 0 || (await sha256($, h, unpacked)) !== p.raw.checksum) {
-      await $.process.run(['rm', '-f', p.tmp, unpacked])
+    await running('unpack', p.file.size)
+    unpacked = join(m, versionsDir(m), `.${v}.${m.plat}.unpacked`)
+    if (!(await unpack($, m, p.tmp, unpacked)) || (await sha256($, m, unpacked)) !== p.raw.checksum) {
+      await removeFiles($, m, p.tmp, unpacked)
       return 'the unpacked binary did not verify; the download was removed, retry to download again'
     }
-    await $.process.run(['rm', '-f', p.tmp])
+    await removeFiles($, m, p.tmp)
   }
 
-  // The installer takes a retained version only when it is executable.
-  const mv = await $.process.run(['sh', '-c', 'mv -f "$1" "$2" && chmod 755 "$2"', '_', unpacked, p.out])
-  return mv.exitCode === 0 ? 'ok' : mv.stderr.trim() || 'could not move the binary into place'
+  return (await moveInto($, m, unpacked, p.out)) || 'ok'
 }
 
 // Runs `claude install <v>` and resolves its exit code and last line.
 async function install($: EngineInterface, h: Host, v: string): Promise<{ code: number | null; line: string }> {
-  const bin = h.os === 'unix' && (await $.fs.exists(`${h.home}/.local/bin/claude`)) ? `${h.home}/.local/bin/claude` : 'claude'
+  const bin = h.os !== 'other' && (await $.fs.exists(claudeBin(h))) ? claudeBin(h) : 'claude'
   const child = $.process.spawn({ argv: [bin, 'install', v] })
   let line = ''
 
@@ -383,7 +464,7 @@ async function runUpgrade($: EngineInterface, n: Notice): Promise<void> {
 
   try {
     const h = await getHost($)
-    if (h.os === 'unix') {
+    if (h.os !== 'other') {
       const got = await fetchBinary($, h, v)
       if (got === 'cancelled') return void (await failed('Cancelled. What was downloaded is kept; retry resumes it.'))
       if (got !== 'ok') return void (await failed(got))

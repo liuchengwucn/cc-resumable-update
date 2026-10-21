@@ -46,35 +46,37 @@ At the prompt of a terminal session:
 
 ## How the upgrade works
 
-On macOS and Linux:
-
 1. Reads `manifest.json` (and `manifest.zst.json` when `zstd` is on your `PATH`)
    for your platform's checksum and size.
-2. Downloads `claude.zst` (about a third of the size), or the plain binary
-   without `zstd`, into `$XDG_DATA_HOME/claude/versions/` (default `~/.local/share/claude/versions/`) as `.<version>.<platform>.zst.partial`,
-   resuming any partial file already there.
+2. Downloads the zstd build (about a third of the size), or the plain binary
+   without `zstd`, into the installer's versions folder,
+   `$XDG_DATA_HOME/claude/versions/` (by default `~/.local/share/claude/versions/`,
+   `%USERPROFILE%\.local\share\claude\versions\` on Windows), as
+   `.<version>.<platform>[.zst].partial`. A partial file already there is resumed.
 3. Checks the download's SHA-256 against the manifest, unpacks it, and checks
    the unpacked binary's SHA-256 too. A file that fails a check is deleted.
-4. Moves it to `claude/versions/<version>` in that folder, marks it executable,
-   and runs `claude install <version>`.
-
-On Windows, and anywhere without `uname`, the upgrade runs `claude install
-<version>` alone, so the download does not resume there yet.
+4. Moves it to `<version>` in that folder (marked executable on macOS and
+   Linux) and runs `claude install <version>`.
 
 Installs made by a package manager (Homebrew, npm, WinGet) get the notice and
 the summary but no Upgrade button. The band tells you to run `claude update`.
 
 ### Requirements
 
-`curl`, plus `sha256sum` or `shasum`. `zstd` is optional and cuts the download
-to about a third.
+- **macOS and Linux:** `curl`, plus `sha256sum` or `shasum`.
+- **Windows:** `curl.exe` (built into Windows 10 1803 and later) and Windows
+  PowerShell, which hashes and moves the files.
+- **Optional everywhere:** `zstd` on your `PATH`, which cuts the download to
+  about a third.
 
 ### Caveat
 
 Step 4 relies on the native installer reusing a binary it finds already in its
-versions folder with the right checksum. That behavior is undocumented. If a
-future release changes it, `claude install` downloads the binary again: the
-upgrade still succeeds but costs the full download.
+versions folder with the right checksum. That behavior is undocumented. The
+[`installer-reuse`](.github/workflows/installer-reuse.yml) workflow checks it
+weekly on Windows, macOS and Linux. If a release changes it, `claude install`
+downloads the binary again: the upgrade still succeeds but costs the full
+download.
 
 ## Network and privacy
 

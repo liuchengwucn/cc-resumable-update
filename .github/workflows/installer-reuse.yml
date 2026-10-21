@@ -1,12 +1,15 @@
 # Does `claude install <version>` reuse a binary placed in its versions folder
-# beforehand, or download it again? The resumable upgrade depends on reuse.
-name: prestage-experiment
+# beforehand, or download it again? The resumable upgrade depends on reuse, so
+# this runs weekly to catch an installer release that changes it.
+name: installer-reuse
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
   push:
     paths:
-      - .github/workflows/prestage-experiment.yml
+      - .github/workflows/installer-reuse.yml
 
 jobs:
   prestage:
@@ -71,3 +74,5 @@ jobs:
           $line = "$plat | installed $installed -> $target | file $result (mtime $before -> $after) | claude install took $([int]$sw.Elapsed.TotalSeconds)s | now runs $now"
           $line
           "### $line" >> $env:GITHUB_STEP_SUMMARY
+          if ($before -ne $after) { throw "claude install downloaded $target again instead of reusing the pre-staged binary" }
+          if ($now -ne $target) { throw "claude --version reports $now after installing $target" }
