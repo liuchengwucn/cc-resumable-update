@@ -1,0 +1,6 @@
+{
+  "name": "cc-resumable-update",
+  "description": "Claude Code release notices, changelog summaries and resumable upgrades",
+  "owner": { "name": "Liu Chengwu" },
+  "plugins": [{ "name": "cc-resumable-update", "source": "./" }]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "cc-resumable-update",
+  "version": "0.1.0",
+  "description": "Notifies you when a new Claude Code release is out on your channel, summarizes its changelog, and upgrades with a resumable download",
+  "author": { "name": "Liu Chengwu", "url": "https://github.com/liuchengwucn" },
+  "homepage": "https://github.com/liuchengwucn/cc-resumable-update",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "channel": {
+      "type": "string",
+      "title": "Release channel",
+      "description": "Which release channel to watch",
+      "default": "stable",
+      "options": ["stable", "latest"]
+    }
+  }
+}
