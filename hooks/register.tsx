@@ -479,9 +479,15 @@ async function runUpgrade($: EngineInterface, n: Notice): Promise<void> {
       totalMiB: 0,
       line: `claude install ${v}`,
     }))
+    // The installer reuses the binary placed here, leaving its mtime as it was.
+    // A changed mtime means it downloaded the binary again.
+    const placed = h.os === 'other' ? null : join(h, versionsDir(h), v)
+    const mtime = async () => (placed ? $.fs.stat(placed).then(s => s.mtimeMs, () => -1) : -1)
+    const before = await mtime()
     const { code, line } = await install($, h, v)
+    const isRedownloaded = before !== -1 && (await mtime()) !== before
     await update($, upgrade, () =>
-      code === 0 ? { phase: 'done', version: v } : { phase: 'failed', version: v, line: line || `claude install exited with ${code}` },
+      code === 0 ? { phase: 'done', version: v, isRedownloaded } : { phase: 'failed', version: v, line: line || `claude install exited with ${code}` },
     )
   } catch (err) {
     await failed(String(err))
@@ -587,9 +593,17 @@ export const register: Register = (on, options) => {
       )
     } else if (u.phase === 'done') {
       row = (
-        <Box>
-          <Text color="green">✓ Installed {v}. Restart claude to use it. </Text>
-          <Button key="close" label="Close" onPress={close} />
+        <Box flexDirection="column">
+          <Box>
+            <Text color="green">✓ Installed {v}. Restart claude to use it. </Text>
+            <Button key="close" label="Close" onPress={close} />
+          </Box>
+          {u.isRedownloaded && (
+            <Text color="yellow">
+              Note: claude install downloaded the binary again instead of reusing the resumed download, so
+              resuming saved nothing this time. Please report it at github.com/liuchengwucn/cc-resumable-update/issues
+            </Text>
+          )}
         </Box>
       )
     } else {

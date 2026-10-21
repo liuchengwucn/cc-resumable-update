@@ -60,7 +60,7 @@ type World = {
 
 // Stands in for the engine and the machine: a native install of 2.1.304 on
 // linux-arm64 with zstd, the stable channel at `channel`.
-function world(on: any, channel: string, badHash = false): World {
+function world(on: any, channel: string, badHash = false, redownload = false): World {
   const w: World = {
     files: new Map([[`${DIR}/2.1.304`, RAW.size]]),
     hashes: new Map(),
@@ -69,6 +69,7 @@ function world(on: any, channel: string, badHash = false): World {
     curlEnds: [ZST.size],
     model: [],
   }
+  const mtimes = new Map<string, number>()
   mock.store(on)
   on('command.register', () => ({ value: { command: 'check-update' } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
@@ -104,7 +105,7 @@ function world(on: any, channel: string, badHash = false): World {
   on('fs.exists', (_: unknown, e: { path: string }) => ({ value: w.files.has(e.path) }))
   on('fs.stat', (_: unknown, e: { path: string }) =>
     w.files.has(e.path)
-      ? { value: { kind: 'file', size: w.files.get(e.path), mtimeMs: 0, isLink: false } }
+      ? { value: { kind: 'file', size: w.files.get(e.path), mtimeMs: mtimes.get(e.path) ?? 0, isLink: false } }
       : { deny: 'ENOENT' },
   )
   on('process.run', (_: unknown, e: { argv: readonly string[] }) => {
@@ -138,6 +139,8 @@ function world(on: any, channel: string, badHash = false): World {
       yield { stream: 'stderr' as const, text: '\r###### 50.0%' }
       return { value: { code: end >= ZST.size ? 0 : 18, signal: null } }
     }
+    // An installer that downloads again replaces the binary, so its mtime moves.
+    if (redownload) mtimes.set(OUT, 999)
     yield { stream: 'stdout' as const, text: 'Claude Code successfully installed!\n' }
     return { value: { code: 0, signal: null } }
   })
@@ -192,6 +195,7 @@ test('upgrading downloads the zstd build with resume, verifies, unpacks and inst
   expect(w.files.has(ZTMP)).toBe(false)
   expect(w.files.has(UNPACKED)).toBe(false)
   expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /downloaded the binary again/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -330,5 +334,22 @@ test('on Windows the plain build downloads with curl.exe and moves into place th
   expect(files.get(`${WDIR}\\2.1.310`)).toBe(WRAW.size)
   expect(ps.some(c => c.script.startsWith('Move-Item') && c.env?.CRU_A === WTMP)).toBe(true)
   expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an installer that downloads the binary again is reported', { options: { channel: 'stable' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  world(on, '2.1.310', false, true)
+  await start($)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'upgrade' })
+  await ui.press({ key: 'confirm' })
+  await clock.advance(10)
+  await clock.settle()
+
+  expect(await ui.find({ type: 'Text', text: /✓ Installed 2\.1\.310/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /downloaded the binary again/ }))?.text).toContain('saved nothing')
   await ui.unmount()
 })

@@ -10,7 +10,9 @@ export type Upgrade =
       totalMiB: number
       line: string
     }
-  | { phase: 'done'; version: string }
+  // isRedownloaded: claude install replaced the binary this mod placed, so the
+  // resumable download saved nothing this time.
+  | { phase: 'done'; version: string; isRedownloaded: boolean }
   | { phase: 'failed'; version: string; line: string }
 
 export type Summary = {

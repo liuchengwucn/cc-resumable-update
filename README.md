@@ -74,8 +74,9 @@ the summary but no Upgrade button. The band tells you to run `claude update`.
 Step 4 relies on the native installer reusing a binary it finds already in its
 versions folder with the right checksum. That behavior is undocumented. The
 [`installer-reuse`](.github/workflows/installer-reuse.yml) workflow checks it
-weekly on Windows, macOS and Linux. If a release changes it, `claude install`
-downloads the binary again: the upgrade still succeeds but costs the full
+weekly on Windows, macOS and Linux, and every upgrade checks it too: when
+`claude install` replaces the binary instead of reusing it, the band says so
+once the install finishes. The upgrade still succeeds then, but costs the full
 download.
 
 ## Network and privacy
