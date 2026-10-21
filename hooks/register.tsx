@@ -36,7 +36,8 @@ type Machine = {
 type Host = Machine | { os: 'other' }
 
 // Windows file operations go through PowerShell, their paths through the
-// environment (CRU_A, CRU_B), so no path needs quoting.
+// environment (CRU_A, CRU_B), so no path needs quoting. The scripts hold no
+// double quotes: Windows argument quoting does not carry them reliably.
 const PS = ['powershell', '-NoProfile', '-NonInteractive', '-Command'] as const
 
 type Entry = { binary: string; checksum: string; size: number }
@@ -107,7 +108,7 @@ async function getWindows($: EngineInterface): Promise<Host> {
     const r = await $.process.run([
       ...PS,
       "$env:USERPROFILE; if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $env:USERPROFILE '.local\\share' }; " +
-        '"$env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_ARCHITEW6432"; ' +
+        "$env:PROCESSOR_ARCHITECTURE + ' ' + $env:PROCESSOR_ARCHITEW6432; " +
         "if (Get-Command zstd -ErrorAction SilentlyContinue) { 'zstd' }",
     ])
     if (r.exitCode === 0) lines = r.stdout.split(/\r?\n/).map(s => s.trim())
