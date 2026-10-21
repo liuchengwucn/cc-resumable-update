@@ -27,7 +27,11 @@ the verified binary without downloading it again.
 
 ## Install
 
-At the prompt of a terminal session:
+Needs **Claude Code 2.1.287 or later**, the release that added mods; an older
+one cannot load this mod at all. Check with `claude --version`, and if yours is
+older, upgrade once by hand first: `claude install stable`.
+
+Then, at the prompt of a terminal session:
 
 ```
 /plugin install cc-resumable-update --marketplace liuchengwucn/cc-resumable-update
@@ -70,6 +74,7 @@ the summary but no Upgrade button. The band tells you to run `claude update`.
 
 ### Requirements
 
+- **Claude Code 2.1.287 or later**, a native install for the Upgrade button.
 - **macOS and Linux:** `curl`, plus `sha256sum` or `shasum`.
 - **Windows:** `curl.exe` (built into Windows 10 1803 and later) and Windows
   PowerShell, which hashes and moves the files.

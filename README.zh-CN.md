@@ -16,7 +16,9 @@ Claude Code 自带的安装器（截至 2.1.304）下载失败后会从头重新
 
 ## 安装
 
-在终端会话的输入框中输入：
+需要 **Claude Code 2.1.287 或更高版本**（mod 机制从这个版本开始提供），更早的版本无法加载本 mod。可以用 `claude --version` 查看当前版本；如果低于这个版本，请先手动升级一次：`claude install stable`。
+
+然后在终端会话的输入框中输入：
 
 ```
 /plugin install cc-resumable-update --marketplace liuchengwucn/cc-resumable-update
@@ -44,6 +46,7 @@ Claude Code 自带的安装器（截至 2.1.304）下载失败后会从头重新
 
 ### 环境要求
 
+- **Claude Code 2.1.287 或更高版本**；Upgrade 按钮需要 native 安装。
 - **macOS 和 Linux**：`curl`，以及 `sha256sum` 或 `shasum`。
 - **Windows**：`curl.exe`（Windows 10 1803 及以后版本自带）和 Windows PowerShell，后者负责计算哈希和移动文件。
 - **所有平台可选**：`PATH` 中的 `zstd`，可将下载量减少到约三分之一。

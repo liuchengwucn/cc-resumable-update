@@ -9,8 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Mods arrived in 2.1.287; which release this mod needs is what this finds.
-        claude: ["2.1.287", "2.1.290", "2.1.292", "2.1.295", "2.1.299", "2.1.301", "2.1.304", "stable"]
+        # 2.1.287 added mods and is the oldest release the README supports.
+        claude: ["2.1.287", "stable"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
