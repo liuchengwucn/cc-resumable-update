@@ -1,5 +1,7 @@
 # cc-resumable-update
 
+English | [简体中文](README.zh-CN.md)
+
 A Claude Code mod for people who keep auto-updates off but still want to hear
 about new releases.
 
