@@ -6,11 +6,18 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mods arrived in 2.1.287; which release this mod needs is what this finds.
+        claude: ["2.1.287", "2.1.290", "2.1.292", "2.1.295", "2.1.299", "2.1.301", "2.1.304", "stable"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Claude Code (native)
-        run: curl -fsSL https://claude.ai/install.sh | bash
+      - name: Install Claude Code ${{ matrix.claude }} (native)
+        run: curl -fsSL https://claude.ai/install.sh | bash -s ${{ matrix.claude }}
+      - name: Version
+        run: ~/.local/bin/claude --version
       - name: Validate
         run: ~/.local/bin/claude plugin validate .
       - name: Test
